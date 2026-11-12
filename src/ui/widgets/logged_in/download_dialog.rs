@@ -6,6 +6,7 @@
 
 use crate::models::asset_data::{AssetData, AssetType};
 use crate::models::project_data::ProjectData;
+use crate::models::project_registry::{self as registry, VersionSource};
 use crate::ui::widgets::download_manager::asset::Asset;
 use crate::ui::widgets::download_manager::{EpicDownloadManager, PostDownloadAction};
 use crate::window::EpicAssetManagerWindow;
@@ -22,6 +23,9 @@ use std::sync::Mutex;
 /// Last project choice made in this session (`Some(None)` = vault only).
 static LAST_PROJECT: Mutex<Option<Option<String>>> = Mutex::new(None);
 
+/// (display name, .uproject path, resolved engine version and where it came from)
+type ProjectEntry = (String, String, Option<(String, VersionSource)>);
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Subject {
@@ -32,24 +36,27 @@ pub enum Subject {
 /// One selectable version: release id for Epic assets, artifact id for Fab assets.
 #[derive(Debug, Clone)]
 pub struct VersionEntry {
-    id: String,
+    /// Dropdown text without the project-dependent suffix
+    pub label: String,
+    pub id: String,
     /// Normalized engine versions ("5.3")
-    engines: Vec<String>,
+    pub engines: Vec<String>,
     platforms: Vec<String>,
+}
+
+impl VersionEntry {
+    /// (major, minor) of every engine version this release supports.
+    pub fn tuples(&self) -> Vec<(u32, u32)> {
+        self.engines
+            .iter()
+            .filter_map(|e| registry::version_tuple(e))
+            .collect()
+    }
 }
 
 /// Reduce "UE_5.3", "5.3.2" or "{GUID}" to "5.3" (or `None` when it is not a version).
 fn normalize_engine(raw: &str) -> Option<String> {
-    let s = raw
-        .trim()
-        .trim_start_matches("UE_")
-        .trim_start_matches("UE ")
-        .trim();
-    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return None;
-    }
-    let parts: Vec<&str> = s.split('.').take(2).collect();
-    Some(parts.join("."))
+    registry::normalize_version(raw)
 }
 
 #[cfg(target_os = "windows")]
@@ -75,7 +82,7 @@ pub mod imp {
         /// Index 0 is always "vault only" (`None`); the rest are `.uproject` paths.
         pub project_paths: RefCell<Vec<Option<String>>>,
         /// Normalized engine association per project entry.
-        pub project_engines: RefCell<Vec<Option<String>>>,
+        pub project_engines: RefCell<Vec<Option<(String, VersionSource)>>>,
         pub versions: RefCell<Vec<VersionEntry>>,
         pub vault_dirs: RefCell<Vec<String>>,
         #[template_child]
@@ -199,7 +206,7 @@ impl EpicDownloadDialog {
         let show_projects = match &subject {
             Subject::Epic(asset) => matches!(
                 AssetData::decide_kind(asset),
-                Some(AssetType::Asset | AssetType::Project)
+                Some(AssetType::Asset | AssetType::Project | AssetType::Plugin)
             ),
             Subject::Fab(_) => true,
         };
@@ -251,7 +258,6 @@ impl EpicDownloadDialog {
     fn setup_versions(&self) {
         let self_ = self.imp();
         let mut entries: Vec<VersionEntry> = Vec::new();
-        let mut labels: Vec<String> = Vec::new();
         match &*self_.subject.borrow() {
             Some(Subject::Epic(asset)) => {
                 if let Some(releases) = asset.sorted_releases() {
@@ -274,11 +280,8 @@ impl EpicDownloadDialog {
                         if !raw_engines.is_empty() {
                             label = format!("{} (UE {})", label, raw_engines.join(", "));
                         }
-                        if entries.is_empty() {
-                            label.push_str(" - latest");
-                        }
-                        labels.push(label);
                         entries.push(VersionEntry {
+                            label,
                             id,
                             engines: raw_engines
                                 .iter()
@@ -312,16 +315,13 @@ impl EpicDownloadDialog {
                         .iter()
                         .map(|e| e.trim_start_matches("UE_").to_string())
                         .collect();
-                    let mut label = if raw_engines.is_empty() {
+                    let label = if raw_engines.is_empty() {
                         pv.artifact_id.clone()
                     } else {
                         format!("UE {}", raw_engines.join(", "))
                     };
-                    if entries.is_empty() {
-                        label.push_str(" - latest");
-                    }
-                    labels.push(label);
                     entries.push(VersionEntry {
+                        label,
                         id: pv.artifact_id.clone(),
                         engines: raw_engines
                             .iter()
@@ -337,10 +337,7 @@ impl EpicDownloadDialog {
         let is_fab = matches!(&*self_.subject.borrow(), Some(Subject::Fab(_)));
         let has_versions = !entries.is_empty();
         self_.versions.replace(entries);
-        let strs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        self_
-            .version_dropdown
-            .set_model(Some(&StringList::new(&strs)));
+        self.refresh_version_labels(None, None);
         if has_versions {
             self_.version_dropdown.set_selected(0);
         } else {
@@ -351,6 +348,45 @@ impl EpicDownloadDialog {
         }
         self_.platform_box.set_visible(is_fab);
         self.update_platforms();
+    }
+
+    /// Rebuild the version dropdown text. With a project engine, releases newer than it are marked
+    /// and the recommended one is flagged; without, the first entry is the latest.
+    fn refresh_version_labels(&self, project: Option<(u32, u32)>, recommended: Option<usize>) {
+        let self_ = self.imp();
+        let previous = self_.version_dropdown.selected();
+        let labels: Vec<String> = self_
+            .versions
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut label = v.label.clone();
+                match project {
+                    None if i == 0 => label.push_str(" - latest"),
+                    None => {}
+                    Some(p) => {
+                        if registry::release_is_newer(p, &v.tuples()) {
+                            label.push_str(&format!(
+                                " - newer than the project (UE {}.{})",
+                                p.0, p.1
+                            ));
+                        }
+                        if recommended == Some(i) {
+                            label.push_str(" - recommended");
+                        }
+                    }
+                }
+                label
+            })
+            .collect();
+        let strs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        self_
+            .version_dropdown
+            .set_model(Some(&StringList::new(&strs)));
+        if previous != gtk4::INVALID_LIST_POSITION && (previous as usize) < labels.len() {
+            self_.version_dropdown.set_selected(previous);
+        }
     }
 
     fn update_platforms(&self) {
@@ -402,10 +438,12 @@ impl EpicDownloadDialog {
 
     fn setup_projects(&self, show_projects: bool) {
         let self_ = self.imp();
-        let mut projects: Vec<(String, String, Option<String>)> = Vec::new();
+        let mut projects: Vec<ProjectEntry> = Vec::new();
         if show_projects {
             if let Some(window) = self_.window.get() {
+                let settings = gio::Settings::new(crate::config::APP_ID);
                 let logged_in = window.imp().logged_in_stack.clone();
+                let engines_box = logged_in.imp().engines.clone();
                 let projects_widget = logged_in.imp().projects.imp();
                 let model = &projects_widget.grid_model;
                 for i in 0..model.n_items() {
@@ -418,9 +456,24 @@ impl EpicDownloadDialog {
                     let Some(path) = data.path() else {
                         continue;
                     };
-                    let engine = data
+                    // Override > numeric EngineAssociation > installed engine (by GUID)
+                    let association = data
                         .uproject()
-                        .and_then(|u| normalize_engine(&u.engine_association));
+                        .map(|u| u.engine_association)
+                        .unwrap_or_default();
+                    let engine =
+                        registry::resolve_engine_version(&settings, &path, &association, || {
+                            engines_box
+                                .engine_from_assoociation(&association)
+                                .and_then(|e| {
+                                    e.version.valid().then(|| {
+                                        format!(
+                                            "{}.{}",
+                                            e.version.major_version, e.version.minor_version
+                                        )
+                                    })
+                                })
+                        });
                     projects.push((data.name().unwrap_or_else(|| path.clone()), path, engine));
                 }
             }
@@ -439,7 +492,7 @@ impl EpicDownloadDialog {
 
         let mut labels = vec!["Don't add to a project (vault only)".to_string()];
         let mut paths: Vec<Option<String>> = vec![None];
-        let mut engines: Vec<Option<String>> = vec![None];
+        let mut engines: Vec<Option<(String, VersionSource)>> = vec![None];
         for (name, path, engine) in projects {
             labels.push(name);
             paths.push(Some(path));
@@ -495,36 +548,65 @@ impl EpicDownloadDialog {
         });
 
         let engine = self_.project_engines.borrow().get(idx).cloned().flatten();
-        let Some(engine) = engine else {
+        let project_version = engine
+            .as_ref()
+            .and_then(|(e, _)| registry::version_tuple(e));
+        let (Some((engine, source)), Some(project_version)) = (engine, project_version) else {
+            self.refresh_version_labels(None, None);
             self_.hint_label.set_label(if has_project {
-                "The project's engine version could not be determined."
+                "The project's engine version is unknown; set an override in the project details."
             } else {
                 "The asset is downloaded to the vault only."
             });
             return;
         };
-        let matching = self_
+
+        // Assets can go up in versions, never down: the highest release not above the project
+        let releases: Vec<Vec<(u32, u32)>> = self_
             .versions
             .borrow()
             .iter()
-            .position(|v| v.engines.contains(&engine));
-        match matching {
-            Some(pos) => {
-                debug!("Download dialog: version {pos} matches project engine UE {engine}");
-                self_.version_dropdown.set_selected(pos as u32);
-                self_.hint_label.set_label(&format!(
-                    "Version matches the project's engine (UE {engine})."
-                ));
-            }
-            None => {
-                self_.hint_label.set_label(&format!(
-                    "No version is listed for the project's engine (UE {engine})."
-                ));
-            }
-        }
+            .map(VersionEntry::tuples)
+            .collect();
+        let choice = registry::choose_release(project_version, &releases);
+        self.refresh_version_labels(Some(project_version), choice.map(|c| c.index()));
+        let Some(choice) = choice else {
+            self_.hint_label.set_label(&format!(
+                "No version with a known engine is listed (project: UE {engine}, {}).",
+                source.label()
+            ));
+            return;
+        };
+        let pos = choice.index();
+        self_.version_dropdown.set_selected(pos as u32);
+        let chosen = releases
+            .get(pos)
+            .and_then(|v| match choice {
+                registry::ReleaseChoice::AllNewer(_) => v.iter().min(),
+                _ => v.iter().filter(|x| **x <= project_version).max(),
+            })
+            .map(|(a, b)| format!("{a}.{b}"))
+            .unwrap_or_default();
+        debug!("Download dialog: {choice:?} for project engine UE {engine} -> UE {chosen}");
+        self_.hint_label.set_label(&match choice {
+            registry::ReleaseChoice::Exact(_) => format!(
+                "Version matches the project's engine (UE {engine}, {}).",
+                source.label()
+            ),
+            registry::ReleaseChoice::Older(_) => format!(
+                "No release for UE {engine} ({}); using the newest older one (UE {chosen}).",
+                source.label()
+            ),
+            registry::ReleaseChoice::AllNewer(_) => format!(
+                "Warning: every release is newer than the project's engine (UE {engine}, {}). \
+                 The lowest (UE {chosen}) is selected and may not work with this project.",
+                source.label()
+            ),
+        });
     }
 
-    fn confirm(&self) {
+    /// Start the download with the current choices and close the dialog.
+    pub fn confirm(&self) {
         let self_ = self.imp();
         let (Some(window), Some(dm)) = (self_.window.get(), self_.download_manager.get()) else {
             return;
@@ -545,13 +627,22 @@ impl EpicDownloadDialog {
                     .parent()
                     .map(|p| p.to_string_lossy().to_string());
                 match dir {
-                    Some(dir) => (
-                        None,
-                        Some(vec![PostDownloadAction::Copy(
+                    Some(dir) => {
+                        let mut actions = vec![PostDownloadAction::Copy(
                             dir,
                             self_.overwrite_switch.is_active(),
-                        )]),
-                    ),
+                        )];
+                        // Plugins go to <project>/Plugins/<PluginName>/ only
+                        let is_plugin = matches!(
+                            &*self_.subject.borrow(),
+                            Some(Subject::Epic(asset))
+                                if matches!(AssetData::decide_kind(asset), Some(AssetType::Plugin))
+                        );
+                        if is_plugin {
+                            actions.push(PostDownloadAction::PluginLayout(Vec::new()));
+                        }
+                        (None, Some(actions))
+                    }
                     None => (None, None),
                 }
             }

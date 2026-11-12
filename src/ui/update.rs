@@ -39,6 +39,12 @@ impl Update for EpicAssetManagerWindow {
             Msg::ProcessFabAsset(fab_asset, image) => {
                 self_.logged_in_stack.add_fab_asset(&fab_asset, image);
             }
+            Msg::UpdateFabAsset(fab_asset, image) => {
+                self_.logged_in_stack.update_fab_asset(&fab_asset, image);
+            }
+            Msg::RemoveFabAsset(id) => {
+                self_.logged_in_stack.remove_fab_asset(&id);
+            }
             Msg::FlushFabAssets => {
                 self_.logged_in_stack.flush_fab_assets();
             }

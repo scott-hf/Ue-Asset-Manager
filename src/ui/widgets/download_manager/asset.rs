@@ -1,4 +1,5 @@
 use crate::tools::asset_info::Search;
+use crate::ui::widgets::download_manager::plugin_layout;
 use crate::ui::widgets::download_manager::Msg::CancelChunk;
 use crate::ui::widgets::download_manager::{Msg, PostDownloadAction, ThreadMessages};
 use glib::clone;
@@ -369,6 +370,7 @@ impl Asset for super::EpicDownloadManager {
         }
         let mut targets: Vec<(String, bool)> = Vec::new();
         let mut to_vault = true;
+        let mut plugin_layout = false;
         {
             let actions = item.actions();
 
@@ -380,9 +382,25 @@ impl Asset for super::EpicDownloadManager {
                     PostDownloadAction::NoVault => {
                         to_vault = false;
                     }
+                    PostDownloadAction::PluginLayout(_) => {
+                        plugin_layout = true;
+                    }
                 }
             }
         };
+        if plugin_layout {
+            // Plugins are always extracted to the vault first, then mapped into the project
+            to_vault = true;
+            let files: Vec<String> = dm[0].files().keys().cloned().collect();
+            match plugin_layout::plugin_roots(&files) {
+                Ok(roots) => item.set_plugin_roots(roots),
+                Err(e) => {
+                    error!("{}", e);
+                    item.set_property("status", e);
+                    return;
+                }
+            }
+        }
 
         let target = if to_vault || targets.is_empty() {
             let mut v = match self.unreal_vault_dir(id) {
@@ -802,18 +820,26 @@ impl Asset for super::EpicDownloadManager {
         };
 
         let mut targets: Vec<(String, bool)> = Vec::new();
+        let mut layout: Option<Vec<plugin_layout::PluginRoot>> = None;
         {
             let actions = item.actions();
 
             for act in actions {
-                if let PostDownloadAction::Copy(t, over) = act {
-                    targets.push((t.clone(), over));
+                match act {
+                    PostDownloadAction::Copy(t, over) => targets.push((t.clone(), over)),
+                    PostDownloadAction::PluginLayout(roots) => layout = Some(roots),
+                    PostDownloadAction::NoVault => {}
                 }
             }
         }
 
         self_.file_pool.execute(move || {
-            copy_files(&PathBuf::from_str(&fullname).unwrap(), targets, &filename);
+            copy_files(
+                &PathBuf::from_str(&fullname).unwrap(),
+                targets,
+                &filename,
+                layout.as_deref(),
+            );
         });
 
         item.add_downloaded_size(progress);
@@ -1314,6 +1340,7 @@ impl AssetPriv for super::EpicDownloadManager {
         ));
         let mut targets: Vec<(String, bool)> = Vec::new();
         let mut to_vault = true;
+        let mut layout: Option<Vec<plugin_layout::PluginRoot>> = None;
         {
             let actions = self
                 .get_item(&f.asset)
@@ -1326,6 +1353,11 @@ impl AssetPriv for super::EpicDownloadManager {
                     }
                     PostDownloadAction::NoVault => {
                         to_vault = false;
+                    }
+                    PostDownloadAction::PluginLayout(roots) => {
+                        // Plugins always go to the vault first, then into the project
+                        to_vault = true;
+                        layout = Some(roots);
                     }
                 }
             }
@@ -1384,7 +1416,7 @@ impl AssetPriv for super::EpicDownloadManager {
                             output
                         }))
                     {
-                        copy_files(&vault.clone(), targets, &finished.name);
+                        copy_files(&vault.clone(), targets, &finished.name, layout.as_deref());
                         let _ = sender.send_blocking(Msg::FinalizeFileDownload(
                             file_c.to_string(),
                             f_c.clone(),
@@ -1465,7 +1497,24 @@ fn extract_chunks(
     hasher
 }
 
-fn copy_files(from: &Path, targets: Vec<(String, bool)>, filename: &str) {
+fn copy_files(
+    from: &Path,
+    targets: Vec<(String, bool)>,
+    filename: &str,
+    plugin_roots: Option<&[plugin_layout::PluginRoot]>,
+) {
+    // Plugins only ever go to <project>/Plugins/<PluginName>/
+    let filename = match plugin_roots {
+        Some(roots) => match plugin_layout::map_plugin_path(roots, filename) {
+            Some(mapped) => mapped,
+            None => {
+                warn!("Not copying {filename} to the project: outside the plugin folder");
+                return;
+            }
+        },
+        None => filename.to_string(),
+    };
+    let filename = filename.as_str();
     for t in targets {
         let mut tar = PathBuf::from_str(&t.0).unwrap();
         tar.push(filename);

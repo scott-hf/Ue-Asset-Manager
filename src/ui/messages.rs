@@ -19,6 +19,10 @@ pub enum Msg {
     FlushAssetThumbnails,
     DownloadImage(KeyImage, AssetInfo),
     ProcessFabAsset(FabAsset, Option<gtk4::gdk::Texture>),
+    /// A library asset whose listing changed since it was cached
+    UpdateFabAsset(FabAsset, Option<gtk4::gdk::Texture>),
+    /// A library asset that is no longer in the library
+    RemoveFabAsset(String),
     FlushFabAssets,
     ProcessFabBrowseResult(FabAsset, Option<gtk4::gdk::Texture>, String),
     FlushFabBrowseResults(Option<String>),

@@ -1,3 +1,4 @@
+use crate::models::project_registry as registry;
 use crate::ui::widgets::logged_in::refresh::Refresh;
 use adw::gtk;
 use gtk4::{self, glib, glib::clone, prelude::*, subclass::prelude::*, CompositeTemplate};
@@ -30,6 +31,8 @@ pub mod imp {
         #[template_child]
         pub projects_grid: TemplateChild<gtk4::GridView>,
         #[template_child]
+        pub add_project_button: TemplateChild<gtk4::Button>,
+        #[template_child]
         pub details: TemplateChild<
             crate::ui::widgets::logged_in::projects::project_detail::UnrealProjectDetails,
         >,
@@ -57,6 +60,7 @@ pub mod imp {
                 download_manager: OnceCell::new(),
                 settings: gtk4::gio::Settings::new(crate::config::APP_ID),
                 projects_grid: TemplateChild::default(),
+                add_project_button: TemplateChild::default(),
                 details: TemplateChild::default(),
                 projects: RefCell::new(BTreeMap::new()),
                 grid_model: gtk4::gio::ListStore::new::<crate::models::project_data::ProjectData>(),
@@ -271,6 +275,85 @@ impl EpicProjectsBox {
     pub fn setup_actions(&self) {
         let self_ = self.imp();
         self.insert_action_group("projects", Some(&self_.actions));
+        self_.add_project_button.connect_clicked(clone!(
+            #[weak(rename_to=projects)]
+            self,
+            move |_| {
+                projects.choose_project_file();
+            }
+        ));
+    }
+
+    /// Ask for a `.uproject` file and register it.
+    fn choose_project_file(&self) {
+        let self_ = self.imp();
+        let filter = gtk4::FileFilter::new();
+        filter.set_name(Some("Unreal projects (*.uproject)"));
+        filter.add_pattern("*.uproject");
+        let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk4::FileDialog::builder()
+            .title("Register Unreal project")
+            .modal(true)
+            .filters(&filters)
+            .default_filter(&filter)
+            .build();
+        let parent = self_.window.get().cloned();
+        dialog.open(
+            parent.as_ref(),
+            None::<&gtk4::gio::Cancellable>,
+            clone!(
+                #[weak(rename_to=projects)]
+                self,
+                move |result| {
+                    if let Some(path) = result.ok().and_then(|f| f.path()) {
+                        projects.register_project_file(&path);
+                    }
+                }
+            ),
+        );
+    }
+
+    /// Register a single `.uproject` file (in addition to the scanned directories) and show it.
+    /// Returns `false` when the file is not a usable `.uproject`.
+    pub fn register_project_file(&self, uproject_file: &Path) -> bool {
+        let self_ = self.imp();
+        let is_uproject = uproject_file.is_file()
+            && uproject_file
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("uproject"));
+        let Some(path_str) = uproject_file.to_str().filter(|_| is_uproject) else {
+            log::warn!("Not a .uproject file: {:?}", uproject_file);
+            return false;
+        };
+        if registry::register_project(&self_.settings, path_str) {
+            info!("Registered project {}", path_str);
+        }
+        self.add_project(uproject_file);
+        true
+    }
+
+    /// Set or clear the engine version override of a project and refresh its tile.
+    pub fn set_engine_override(&self, uproject_file: &str, version: Option<&str>) {
+        let self_ = self.imp();
+        if !registry::set_engine_override(&self_.settings, uproject_file, version) {
+            log::warn!("Unable to store engine version override for {uproject_file}");
+        }
+        let key = registry::path_key(uproject_file);
+        for i in 0..self_.grid_model.n_items() {
+            let Some(data) = self_
+                .grid_model
+                .item(i)
+                .and_downcast::<crate::models::project_data::ProjectData>()
+            else {
+                continue;
+            };
+            if data.path().is_some_and(|p| registry::path_key(&p) == key) {
+                // Rebind the tile so it shows the new version
+                self_.grid_model.items_changed(i, 1, 1);
+                break;
+            }
+        }
     }
 
     pub fn remove_invalid(&self) {
@@ -312,7 +395,7 @@ impl EpicProjectsBox {
                 self_
                     .projects
                     .borrow_mut()
-                    .remove(directory.to_str().unwrap());
+                    .remove(&registry::path_key(directory.to_str().unwrap()));
             }
         }
     }
@@ -328,6 +411,15 @@ impl EpicProjectsBox {
                 Self::check_path_for_uproject(&path, &s);
             });
         }
+        // Individually registered projects
+        for uproject in registry::registered_projects(&self_.settings) {
+            let file = PathBuf::from(&uproject);
+            if file.is_file() {
+                self.add_project(&file);
+            } else {
+                log::warn!("Registered project not found: {uproject}");
+            }
+        }
     }
 
     fn add_project(&self, uproject_file: &Path) {
@@ -338,7 +430,10 @@ impl EpicProjectsBox {
                     if self_
                         .projects
                         .borrow_mut()
-                        .insert(directory.to_str().unwrap().to_string(), name.to_string())
+                        .insert(
+                            registry::path_key(directory.to_str().unwrap()),
+                            name.to_string(),
+                        )
                         .is_none()
                     {
                         self_

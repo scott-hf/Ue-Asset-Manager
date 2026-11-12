@@ -2,6 +2,7 @@ pub mod asset_data;
 pub mod category_data;
 pub mod database;
 pub mod engine_data;
+pub mod fab_cache;
 pub mod fab_data;
 pub mod fab_overlay;
 pub mod fab_search_data;
@@ -9,6 +10,7 @@ pub mod local_library;
 pub mod log_data;
 mod plugin_data;
 pub mod project_data;
+pub mod project_registry;
 
 use crate::config::APP_ID;
 use egs_api::EpicGames;

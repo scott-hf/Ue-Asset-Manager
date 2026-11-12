@@ -2,9 +2,8 @@ use glib::clone;
 use gtk4::subclass::prelude::*;
 use gtk4::{self, gio, prelude::*};
 use gtk4::{glib, CompositeTemplate};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use std::path::PathBuf;
-
 
 pub mod imp {
     use super::*;
@@ -160,7 +159,7 @@ impl FabLibraryBox {
         self_.window.set(window.clone()).unwrap();
         self.setup_grid();
         self.load_cached_fab_assets();
-        self.fetch_fab_assets();
+        self.fetch_fab_assets(false);
     }
 
     pub fn set_download_manager(
@@ -632,28 +631,13 @@ impl FabLibraryBox {
     }
 
     fn fab_cache_dir(cache_dir: &str) -> PathBuf {
-        let mut path = PathBuf::from(cache_dir);
-        path.push("fab");
-        path
+        crate::models::fab_cache::cache_dir(cache_dir)
     }
 
     fn cache_fab_asset(asset: &egs_api::api::types::fab_library::FabAsset, cache_dir: &str) {
-        let mut cache_path = Self::fab_cache_dir(cache_dir);
-        cache_path.push(&asset.asset_id);
-        if std::fs::create_dir_all(&cache_path).is_err() {
-            warn!("Failed to create FAB cache directory: {:?}", cache_path);
-            return;
-        }
-        cache_path.push("fab_asset.json");
-        match std::fs::File::create(&cache_path) {
-            Ok(file) => {
-                if let Err(e) = serde_json::to_writer(file, asset) {
-                    warn!("Failed to write FAB cache for {}: {}", asset.asset_id, e);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to create FAB cache file {:?}: {}", cache_path, e);
-            }
+        let dir = Self::fab_cache_dir(cache_dir);
+        if let Err(e) = crate::models::fab_cache::write_asset(&dir, asset) {
+            warn!("Failed to write FAB cache for {}: {}", asset.asset_id, e);
         }
     }
 
@@ -665,6 +649,13 @@ impl FabLibraryBox {
         if !fab_cache.is_dir() {
             debug!(
                 "No FAB cache directory at {:?}, skipping cache load",
+                fab_cache
+            );
+            return;
+        }
+        if !crate::models::fab_cache::is_usable(&fab_cache) {
+            warn!(
+                "Ignoring unreadable or foreign FAB cache at {:?}",
                 fab_cache
             );
             return;
@@ -732,7 +723,10 @@ impl FabLibraryBox {
         }
     }
 
-    pub fn fetch_fab_assets(&self) {
+    /// Fetch the library listing and merge it with the cache. Without `full` only new and changed
+    /// assets are written/sent to the UI (the rest is already shown from the cache); with `full`
+    /// everything is rewritten and assets that left the library are dropped.
+    pub fn fetch_fab_assets(&self, full: bool) {
         let self_ = self.imp();
         self_.refresh_progress.set_visible(true);
         self_.refresh_progress.pulse();
@@ -761,8 +755,25 @@ impl FabLibraryBox {
                 let fab_library = crate::RUNTIME.block_on(eg.fab_library_items(account_id));
 
                 if let Some(library) = fab_library {
+                    use crate::models::fab_cache;
                     debug!("Got {} FAB assets from API", library.results.len());
-                    for asset in &library.results {
+                    let dir = Self::fab_cache_dir(&cache_dir);
+                    let fetched_ids: Vec<String> =
+                        library.results.iter().map(|a| a.asset_id.clone()).collect();
+                    let cached = if full || !fab_cache::is_usable(&dir) {
+                        std::collections::HashMap::new()
+                    } else {
+                        fab_cache::load_all(&dir)
+                    };
+                    let delta = fab_cache::merge_delta(&cached, library.results);
+                    info!(
+                        "FAB library: {} new, {} changed, {} unchanged{}",
+                        delta.added.len(),
+                        delta.changed.len(),
+                        delta.unchanged,
+                        if full { " (full refresh)" } else { "" }
+                    );
+                    for asset in &delta.added {
                         if !crate::RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
                             return;
                         }
@@ -775,6 +786,34 @@ impl FabLibraryBox {
                                 texture,
                             ))
                             .unwrap();
+                    }
+                    for asset in &delta.changed {
+                        if !crate::RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+
+                        Self::cache_fab_asset(asset, &cache_dir);
+                        let texture = Self::load_fab_thumbnail(asset, &cache_dir);
+                        sender
+                            .send_blocking(crate::ui::messages::Msg::UpdateFabAsset(
+                                asset.clone(),
+                                texture,
+                            ))
+                            .unwrap();
+                    }
+                    // The API call returns what it got even when a page failed, so assets are
+                    // only dropped on an explicit full refresh.
+                    if full && !fetched_ids.is_empty() {
+                        let gone: Vec<String> = fab_cache::ids_on_disk(&dir)
+                            .into_iter()
+                            .filter(|id| !fetched_ids.contains(id))
+                            .collect();
+                        fab_cache::remove_assets(&dir, &gone);
+                    }
+                    if !fetched_ids.is_empty() {
+                        if let Err(e) = fab_cache::write_index(&dir, &fetched_ids) {
+                            warn!("Failed to write the FAB cache index: {}", e);
+                        }
                     }
                 } else {
                     error!("Failed to fetch FAB library from API");
@@ -839,6 +878,50 @@ impl FabLibraryBox {
         self.add_asset_categories(asset);
         let data = crate::models::fab_data::FabData::new(asset, image);
         self_.grid_model.append(&data);
+        self.update_count();
+    }
+
+    /// Replace a library asset whose listing changed (adds it when it is not shown yet).
+    pub fn update_fab_asset(
+        &self,
+        asset: &egs_api::api::types::fab_library::FabAsset,
+        image: Option<gtk4::gdk::Texture>,
+    ) {
+        let self_ = self.imp();
+        for i in 0..self_.grid_model.n_items() {
+            let Some(old) = self_
+                .grid_model
+                .item(i)
+                .and_downcast::<crate::models::fab_data::FabData>()
+            else {
+                continue;
+            };
+            if old.id() == asset.asset_id {
+                self.add_asset_categories(asset);
+                let data = crate::models::fab_data::FabData::new(asset, image);
+                self_.grid_model.splice(i, 1, &[data]);
+                self.update_filter();
+                return;
+            }
+        }
+        self.add_fab_asset(asset, image);
+    }
+
+    /// Drop a library asset that is no longer in the library.
+    pub fn remove_fab_asset(&self, id: &str) {
+        let self_ = self.imp();
+        for i in 0..self_.grid_model.n_items() {
+            let matches = self_
+                .grid_model
+                .item(i)
+                .and_downcast::<crate::models::fab_data::FabData>()
+                .is_some_and(|d| d.id() == id);
+            if matches {
+                self_.grid_model.remove(i);
+                break;
+            }
+        }
+        self_.known_asset_ids.borrow_mut().remove(id);
         self.update_count();
     }
 
@@ -1162,6 +1245,6 @@ impl FabLibraryBox {
 
     pub fn run_refresh(&self) {
         self.clear();
-        self.fetch_fab_assets();
+        self.fetch_fab_assets(true);
     }
 }

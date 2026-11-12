@@ -254,6 +254,20 @@ impl EpicLoggedInBox {
         self_.fab.add_fab_asset(asset, image);
     }
 
+    pub fn update_fab_asset(
+        &self,
+        asset: &egs_api::api::types::fab_library::FabAsset,
+        image: Option<gtk4::gdk::Texture>,
+    ) {
+        let self_ = self.imp();
+        self_.fab.update_fab_asset(asset, image);
+    }
+
+    pub fn remove_fab_asset(&self, id: &str) {
+        let self_ = self.imp();
+        self_.fab.remove_fab_asset(id);
+    }
+
     pub fn flush_fab_assets(&self) {
         let self_ = self.imp();
         self_.fab.flush_fab_assets();

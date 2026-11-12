@@ -68,6 +68,16 @@
             <default>[]</default>
             <summary>Unreal Projects Directories</summary>
         </key>
+        <key name="registered-projects" type="as">
+            <default>[]</default>
+            <summary>Individually registered Unreal projects</summary>
+            <description>Paths of .uproject files added by hand, in addition to the scanned project directories</description>
+        </key>
+        <key name="project-engine-versions" type="a{ss}">
+            <default>{}</default>
+            <summary>Engine version overrides per project</summary>
+            <description>Maps a .uproject path to the engine version (for example 5.8) used when the project's own engine association cannot be resolved</description>
+        </key>
         <key name="dark-mode" type="b">
             <default>false</default>
             <summary>Enable or disable dark mode</summary>

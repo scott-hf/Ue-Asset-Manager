@@ -683,6 +683,17 @@ impl EpicDownloadItem {
         current.append(&mut result);
     }
 
+    /// Replace the plugin folder mapping of a `PluginLayout` action.
+    pub fn set_plugin_roots(
+        &self,
+        roots: Vec<crate::ui::widgets::download_manager::plugin_layout::PluginRoot>,
+    ) {
+        let self_ = self.imp();
+        let mut current = self_.post_actions.borrow_mut();
+        current.retain(|a| !matches!(a, PostDownloadAction::PluginLayout(_)));
+        current.push(PostDownloadAction::PluginLayout(roots));
+    }
+
     pub fn actions(&self) -> Vec<PostDownloadAction> {
         let self_ = self.imp();
         self_.post_actions.borrow().clone()

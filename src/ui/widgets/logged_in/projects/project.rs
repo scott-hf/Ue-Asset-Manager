@@ -1,4 +1,5 @@
 use crate::models::project_data::Uproject;
+use crate::models::project_registry as registry;
 use crate::schema::unreal_project_latest_engine;
 use crate::ui::widgets::logged_in::engines::UnrealEngine;
 use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
@@ -154,50 +155,15 @@ impl EpicProject {
         self_.data.replace(Some(data.clone()));
         self.set_property("name", data.name());
         self.set_property("tooltip-text", data.path());
-        data.uproject().map_or_else(
-            || {
-                self.set_property("engine", "");
-            },
-            |uproject| match self.associated_engine(&uproject) {
-                None => {
-                    let db = crate::models::database::connection();
-                    #[allow(clippy::collection_is_never_read)]
-                    let mut last_engine: Option<String> = None;
-                    if let Ok(mut conn) = db.get() {
-                        let engines: Result<String, diesel::result::Error> =
-                            unreal_project_latest_engine::table
-                                .filter(
-                                    crate::schema::unreal_project_latest_engine::project
-                                        .eq(&data.path().unwrap()),
-                                )
-                                .select(crate::schema::unreal_project_latest_engine::engine)
-                                .first(&mut conn);
-                        if let Ok(last) = engines {
-                            last_engine = Some(last);
-                        }
-                    };
-                    last_engine.map_or_else(
-                        || {
-                            self.set_property("engine", "Unknown Engine");
-                        },
-                        |eng| {
-                            crate::models::engine_data::EngineData::read_engine_version(&eng)
-                                .map_or_else(
-                                    || {
-                                        self.set_property("engine", eng);
-                                    },
-                                    |version| {
-                                        self.set_property("engine", version.format());
-                                    },
-                                );
-                        },
-                    );
-                }
-                Some(eng) => {
-                    self.set_property("engine", eng.version.format());
-                }
-            },
-        );
+        let engine_override = data
+            .path()
+            .and_then(|p| registry::engine_override(&self_.settings, &p))
+            .and_then(|v| registry::normalize_version(&v));
+        if let Some(version) = engine_override {
+            self.set_property("engine", format!("{version} (override)"));
+        } else {
+            self.set_engine_from_project(data);
+        }
 
         if let Some(pix) = data.image() {
             self_.thumbnail.set_paintable(Some(&pix));
@@ -231,6 +197,57 @@ impl EpicProject {
                 }
             ),
         )));
+    }
+
+    fn set_engine_from_project(&self, data: &crate::models::project_data::ProjectData) {
+        data.uproject().map_or_else(
+            || {
+                self.set_property("engine", "");
+            },
+            |uproject| match self.associated_engine(&uproject) {
+                None => {
+                    let db = crate::models::database::connection();
+                    #[allow(clippy::collection_is_never_read)]
+                    let mut last_engine: Option<String> = None;
+                    if let Ok(mut conn) = db.get() {
+                        let engines: Result<String, diesel::result::Error> =
+                            unreal_project_latest_engine::table
+                                .filter(
+                                    crate::schema::unreal_project_latest_engine::project
+                                        .eq(&data.path().unwrap()),
+                                )
+                                .select(crate::schema::unreal_project_latest_engine::engine)
+                                .first(&mut conn);
+                        if let Ok(last) = engines {
+                            last_engine = Some(last);
+                        }
+                    };
+                    last_engine.map_or_else(
+                        || {
+                            // No installed engine: fall back to a numeric association
+                            match registry::normalize_version(&uproject.engine_association) {
+                                Some(version) => self.set_property("engine", version),
+                                None => self.set_property("engine", "Unknown Engine"),
+                            }
+                        },
+                        |eng| {
+                            crate::models::engine_data::EngineData::read_engine_version(&eng)
+                                .map_or_else(
+                                    || {
+                                        self.set_property("engine", eng);
+                                    },
+                                    |version| {
+                                        self.set_property("engine", version.format());
+                                    },
+                                );
+                        },
+                    );
+                }
+                Some(eng) => {
+                    self.set_property("engine", eng.version.format());
+                }
+            },
+        );
     }
 
     fn finished(&self, data: &crate::models::project_data::ProjectData) {

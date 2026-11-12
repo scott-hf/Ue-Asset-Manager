@@ -2,6 +2,7 @@ pub mod asset;
 pub mod docker;
 mod download_item;
 pub mod epic_file;
+pub mod plugin_layout;
 
 use crate::ui::widgets::download_manager::asset::Asset;
 use crate::ui::widgets::download_manager::docker::Docker;
@@ -75,6 +76,9 @@ pub enum DownloadStatus {
 pub enum PostDownloadAction {
     Copy(String, bool),
     NoVault,
+    /// Copies into a project go to `Plugins/<PluginName>/` only (see `plugin_layout`). The plugin
+    /// folders are filled in from the manifest when the download starts.
+    PluginLayout(Vec<plugin_layout::PluginRoot>),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -1,7 +1,9 @@
 use crate::models::project_data::Uproject;
+use crate::models::project_registry as registry;
 use crate::schema::unreal_project_latest_engine;
 use crate::ui::widgets::button_cust::ButtonEpic;
 use crate::ui::widgets::logged_in::engines::UnrealEngine;
+use adw::prelude::*;
 use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 use gtk4::glib::clone;
 use gtk4::subclass::prelude::*;
@@ -350,6 +352,49 @@ impl UnrealProjectDetails {
                 &text,
             ));
 
+        // Engine version: override > numeric association > installed engine
+        let path_str = self.path().unwrap();
+        let version_row = adw::ActionRow::builder()
+            .title("Engine version")
+            .css_classes(["property"])
+            .build();
+        self.update_version_row(&version_row, project, &path_str);
+        self_.details.append(&version_row);
+
+        let override_row = adw::EntryRow::builder()
+            .title("Engine version override (for example 5.8)")
+            .show_apply_button(true)
+            .build();
+        if let Some(v) = registry::engine_override(&self_.settings, &path_str) {
+            override_row.set_text(&v);
+        }
+        let project_copy = project.clone();
+        override_row.connect_apply(clone!(
+            #[weak(rename_to=detail)]
+            self,
+            #[weak]
+            version_row,
+            move |entry| {
+                let text = entry.text().to_string();
+                let text = text.trim();
+                if text.is_empty() {
+                    entry.remove_css_class("error");
+                    detail.apply_engine_override(None);
+                } else if let Some(v) = registry::normalize_version(text) {
+                    entry.remove_css_class("error");
+                    detail.apply_engine_override(Some(&v));
+                } else {
+                    // Not a version such as 5.8
+                    entry.add_css_class("error");
+                    return;
+                }
+                if let Some(p) = detail.path() {
+                    detail.update_version_row(&version_row, &project_copy, &p);
+                }
+            }
+        ));
+        self_.details.append(&override_row);
+
         // Path
         let text = parent.to_str().unwrap();
         let text = format!("Path: {text}");
@@ -366,6 +411,38 @@ impl UnrealProjectDetails {
             .append(&crate::window::EpicAssetManagerWindow::create_widget_row(
                 &text, &button,
             ));
+    }
+
+    /// Version of an installed engine matching the project's association (for GUID associations).
+    fn installed_engine_version(&self, project: &Uproject) -> Option<String> {
+        self.associated_engine(project).and_then(|e| {
+            e.version
+                .valid()
+                .then(|| format!("{}.{}", e.version.major_version, e.version.minor_version))
+        })
+    }
+
+    fn update_version_row(&self, row: &adw::ActionRow, project: &Uproject, path: &str) {
+        let self_ = self.imp();
+        let resolved = registry::resolve_engine_version(
+            &self_.settings,
+            path,
+            &project.engine_association,
+            || self.installed_engine_version(project),
+        );
+        row.set_subtitle(&match resolved {
+            Some((version, source)) => format!("{version} ({})", source.label()),
+            None => "Unknown - enter a version below".to_string(),
+        });
+    }
+
+    fn apply_engine_override(&self, version: Option<&str>) {
+        let self_ = self.imp();
+        let (Some(path), Some(window)) = (self.path(), self_.window.get()) else {
+            return;
+        };
+        let logged_in = window.imp().logged_in_stack.clone();
+        logged_in.imp().projects.set_engine_override(&path, version);
     }
 
     fn populate_engines(
