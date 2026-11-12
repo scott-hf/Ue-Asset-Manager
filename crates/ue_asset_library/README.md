@@ -5,19 +5,50 @@ No GTK; the app crate depends on the library for scanning and importing.
 
 ## What the sanitizer does
 
-Zips dropped directly into a job's `<import>/` folder (or into an optional
-`<import>/unprocessed/` subfolder, kept for compatibility) are checked (path hardening,
+Zips, `.7z`, `.rar` and multi-volume archives dropped directly into a job's `<import>/`
+folder (or into an optional `<import>/unprocessed/` subfolder, kept for compatibility) are checked (path hardening,
 size caps), classified (Content / Plugin / Project), rewritten to the layout Unreal
 expects (`Content/<Folder>/...` or `Plugins/<Name>/...`, build output removed) and stored
 in the job's library folder as `<slug>.<sha12>.zip` plus a `<slug>.<sha12>.zip.json`
 sidecar. The sidecar is written last and is the commit marker. Originals are never
 deleted, only moved between state folders.
 
+### Archive inputs (`.7z`, `.rar`, multi-volume)
+
+Supported names: `x.zip`, `x.7z`, `x.rar`, `x.7z.001/.002/...`, `x.zip.001/...`,
+`x.part1.rar/x.part2.rar/...` and `x.rar` + `x.r00/x.r01/...`. Files are grouped per inbox
+folder into volume sets. A set is processed only when every volume (1..N, no gaps) is present
+and all volumes are stable; a set with a missing volume simply waits (reported as `waiting`,
+nothing is moved). For `.7z` the expected total size is read from the 7z start header, so a
+missing last volume is detected too; for RAR a missing trailing volume surfaces as a
+`MISSING_VOLUME` result that puts the set back and retries without counting an attempt.
+Only the first volume is the entry point: the claim file is `<first volume>.claim`, and all
+volumes move together into `processing/`, then `processed/` (or `needs-review/` / `failed/`).
+
+The archive is converted to a temp zip inside the library folder (same filesystem), then
+the normal sanitizer runs on it, so the output is always `<slug>.<sha12>.zip` plus sidecar.
+`sha256` (and the `sha12` in the file name) is the hash of the original archive: all volumes
+in order, so duplicate detection works. The sidecar `source_zip` is the first volume's name;
+`extra.source_format` (`7z`/`rar`/`split-zip`) and, for sets, `extra.source_volumes` are added.
+Hardening is the same as for zips (`..`, absolute paths, drive/stream names, reserved names,
+symlinks, case collisions, entry/size caps). Password-protected archives go to
+`needs-review/` with code `ENCRYPTED`; damaged or unreadable ones with `ARCHIVE_CORRUPT`.
+
+Libraries: `sevenz-rust2` (pure Rust, streams 7z straight into the temp zip; split 7z is read
+through a chained reader) and `unrar` (bundled UnRAR C++ source, so no external binary).
+RAR content is extracted to `library/.tmp-<id>/` under names the sanitizer chose, then zipped.
+On windows-gnu the crate links `advapi32` itself (raw-dylib), which `unrar_sys` forgets.
+
+Names: version ranges such as `Pack (5.0 – 5.8)`, `Pack[5.0-5.3]` are stripped from the display
+name; `engine_version_guess` is the lowest endpoint and `extra.engine_version_min` /
+`engine_version_max` hold the range. Archive suffixes (`.7z`, `.rar`, `.001`, `.part1.rar`) are
+removed before cleaning.
+
 ## Import folder states
 
 | Folder | Meaning |
 | --- | --- |
-| `<import>/` itself | The inbox. Zips lying directly here are picked up once their size and modified time stay unchanged for `stable_secs`. Subfolders are never treated as inboxes. `*.part`, `*.tmp`, `*.claim` are ignored; other non-zip files (e.g. a loose `.uasset`) are reported and left in place. |
+| `<import>/` itself | The inbox. Zips lying directly here are picked up once their size and modified time stay unchanged for `stable_secs`. Subfolders are never treated as inboxes. `*.part`, `*.tmp`, `*.claim` are ignored; other non-archive files (e.g. a loose `.uasset`) are reported and left in place. |
 | `unprocessed/` | Optional second inbox (compatibility). Missing or empty is fine; it is never created. |
 | `processing/` | A zip being worked on, next to a `<name>.claim` file (host, pid, start time). Exactly one process wins a claim. Two zips with the same name in both inboxes are handled one after the other; `processed/` keeps both (a unique suffix is added). |
 | `processed/` | Done (also duplicates of an already stored zip, with a `.duplicate.txt` note). |
@@ -92,5 +123,7 @@ the task command (`cmd /c "... >> C:\Tools\sanitizer.log 2>&1"`) when you want a
 
 ## Tests
 
-`cargo test -p ue_asset_library`. Tests that use the three real sample zips are skipped
+`cargo test -p ue_asset_library`. `tests/archives.rs` builds its 7z / split fixtures in
+process (no RAR writer exists, so RAR is covered by garbage-input tests and manual runs against
+real archives). Tests that use the three real sample zips are skipped
 when they are not present (`UE_ASSET_SAMPLES` overrides the folder).

@@ -2,7 +2,7 @@
 
 use crate::error::{NeedsReview, SanitizeError};
 use crate::layout::{plan_layout, Layout};
-use crate::name::clean_name;
+use crate::name::clean_name_ranged;
 use crate::sidecar::{Kind, Sidecar, SCHEMA_VERSION};
 use crate::util::{is_busy_error, rfc3339_utc, sha256_file, slugify, unique_token, unix_secs};
 use std::fs::{self, File};
@@ -45,6 +45,21 @@ fn map_open_error(e: ZipError) -> SanitizeError {
 }
 
 /// Library zip with the same source hash, if present together with its sidecar.
+pub(crate) fn find_duplicate_pub(library_dir: &Path, sha12: &str) -> Option<PathBuf> {
+    find_duplicate(library_dir, sha12)
+}
+
+/// Identity of an original (non-zip or multi-volume) archive whose converted temp zip is
+/// being sanitized: the library records these instead of the temp zip's own.
+pub(crate) struct SourceOverride {
+    /// First volume file name (`source_zip` in the sidecar).
+    pub name: String,
+    /// SHA-256 over all volumes in order.
+    pub sha256: String,
+    pub volumes: Vec<String>,
+    pub format: &'static str,
+}
+
 fn find_duplicate(library_dir: &Path, sha12: &str) -> Option<PathBuf> {
     let suffix = format!(".{sha12}.zip");
     for e in fs::read_dir(library_dir).ok()?.flatten() {
@@ -100,20 +115,31 @@ fn write_zip(src: &Path, layout: &Layout, tmp: &Path) -> Result<(), SanitizeErro
 /// Temp files are created inside `library_dir` (same filesystem), the zip is renamed
 /// into place first and the sidecar is renamed in LAST. The original is not moved.
 pub fn sanitize_zip(src: &Path, library_dir: &Path) -> Result<SanitizeOutcome, SanitizeError> {
+    sanitize_zip_with(src, library_dir, None)
+}
+
+pub(crate) fn sanitize_zip_with(
+    src: &Path,
+    library_dir: &Path,
+    ov: Option<&SourceOverride>,
+) -> Result<SanitizeOutcome, SanitizeError> {
     fs::create_dir_all(library_dir)?;
-    let file_name = src
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unnamed.zip".into());
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(s, _)| s.to_string())
-        .unwrap_or_else(|| file_name.clone());
+    let file_name = match ov {
+        Some(o) => o.name.clone(),
+        None => src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unnamed.zip".into()),
+    };
+    let stem = crate::archive::source_stem(&file_name);
 
     // Open first: a truncated zip is reported before any hashing work.
     let mut archive = ZipArchive::new(BufReader::with_capacity(1 << 20, File::open(src)?))
         .map_err(map_open_error)?;
-    let sha = sha256_file(src)?;
+    let sha = match ov {
+        Some(o) => o.sha256.clone(),
+        None => sha256_file(src)?,
+    };
     let sha12 = &sha[..12];
     if let Some(existing) = find_duplicate(library_dir, sha12) {
         return Ok(SanitizeOutcome::Duplicate { existing });
@@ -124,7 +150,8 @@ pub fn sanitize_zip(src: &Path, library_dir: &Path) -> Result<SanitizeOutcome, S
         return Err(SanitizeError::NeedsReview(NeedsReview::NoContent));
     }
 
-    let (display_name, name_version) = clean_name(&stem);
+    let cn = clean_name_ranged(&stem);
+    let (display_name, name_version) = (cn.display.clone(), cn.version.clone());
     let slug = slugify(&display_name);
     let zip_name = format!("{slug}.{sha12}.zip");
     let zip_path = library_dir.join(&zip_name);
@@ -136,6 +163,17 @@ pub fn sanitize_zip(src: &Path, library_dir: &Path) -> Result<SanitizeOutcome, S
         return Err(e);
     }
 
+    let mut extra = serde_json::Map::new();
+    if let Some((lo, hi)) = &cn.range {
+        extra.insert("engine_version_min".into(), lo.clone().into());
+        extra.insert("engine_version_max".into(), hi.clone().into());
+    }
+    if let Some(o) = ov {
+        extra.insert("source_format".into(), o.format.into());
+        if o.volumes.len() > 1 {
+            extra.insert("source_volumes".into(), serde_json::json!(o.volumes));
+        }
+    }
     let sidecar = Sidecar {
         schema: SCHEMA_VERSION,
         kind: layout.kind,
@@ -154,7 +192,7 @@ pub fn sanitize_zip(src: &Path, library_dir: &Path) -> Result<SanitizeOutcome, S
         sanitized_at: rfc3339_utc(unix_secs()),
         marketplace_url: layout.marketplace_url.clone(),
         friendly_name: layout.friendly_name.clone(),
-        extra: serde_json::Map::new(),
+        extra,
     };
     let json = serde_json::to_vec_pretty(&sidecar).map_err(|e| SanitizeError::Io(e.to_string()))?;
 

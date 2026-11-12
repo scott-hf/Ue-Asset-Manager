@@ -11,6 +11,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 zip = "8"
+sevenz-rust2 = "0.25"
+unrar = "0.5"
 
 [[bin]]
 name = "ue_asset_sanitizer"
