@@ -1079,3 +1079,68 @@ fn read_helper_compiles() {
         .unwrap();
     assert_eq!(s, "ok");
 }
+
+// ---------- One-File-Per-Actor folders and outlier tolerance ----------
+
+#[test]
+fn external_actors_do_not_make_a_second_root() {
+    let t = Tmp::new();
+    let src = t.path().join("Pack 5.1.zip");
+    make_zip(
+        &src,
+        &[
+            (
+                "Content/Pack/Materials/M_A.uasset",
+                fake_asset("/Game/Pack/Materials/M_A", &[]),
+            ),
+            (
+                "Content/__ExternalActors__/Pack/Maps/Lvl/A/BC/ACTOR1.uasset",
+                fake_asset("/Game/__ExternalActors__/Pack/Maps/Lvl/A/BC/ACTOR1", &[]),
+            ),
+            (
+                "Content/__ExternalObjects__/Pack/Maps/Lvl/9/ZZ/OBJ1.uasset",
+                vec![1, 2, 3],
+            ),
+        ],
+    );
+    let (zip, sc) = sanitized(&src, &t.dir("lib"));
+    assert_eq!(sc.content_folder.as_deref(), Some("Pack"));
+    assert_eq!(sc.entry_count, 3);
+    for r in [
+        "Content/Pack",
+        "Content/__ExternalActors__",
+        "Content/__ExternalObjects__",
+    ] {
+        assert!(sc.allowed_roots.iter().any(|x| x == r), "{r}");
+    }
+    let names = names_of(&zip);
+    assert!(
+        names.contains(&"Content/__ExternalActors__/Pack/Maps/Lvl/A/BC/ACTOR1.uasset".to_string())
+    );
+    assert!(
+        names.contains(&"Content/__ExternalObjects__/Pack/Maps/Lvl/9/ZZ/OBJ1.uasset".to_string())
+    );
+}
+
+#[test]
+fn single_outlier_asset_is_tolerated() {
+    let t = Tmp::new();
+    let src = t.path().join("Pack 4.27.zip");
+    let mut entries: Vec<(String, Vec<u8>)> = (0..30)
+        .map(|i| {
+            (
+                format!("P/Materials/M_{i}.uasset"),
+                fake_asset(&format!("/Game/P/Materials/M_{i}"), &[]),
+            )
+        })
+        .collect();
+    entries.push(("P/Z/X.uasset".into(), fake_asset("/Game/Z/X", &[])));
+    let refs: Vec<(&str, Vec<u8>)> = entries
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.clone()))
+        .collect();
+    make_zip(&src, &refs);
+    let (_z, sc) = sanitized(&src, &t.dir("lib"));
+    assert_eq!(sc.content_folder.as_deref(), Some("P"));
+    assert_eq!(sc.entry_count, 31);
+}

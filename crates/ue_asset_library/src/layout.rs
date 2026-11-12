@@ -74,6 +74,17 @@ fn dir_of(path: &str) -> &str {
     }
 }
 
+/// UE One-File-Per-Actor folders: they sit next to the content folders under `Content/`
+/// and hold actor/object packages without a `/Game/` own path of their own.
+fn is_ofpa_dir(name: &str) -> bool {
+    name.eq_ignore_ascii_case("__ExternalActors__")
+        || name.eq_ignore_ascii_case("__ExternalObjects__")
+}
+
+fn in_ofpa(path: &str) -> bool {
+    path.split('/').any(is_ofpa_dir)
+}
+
 fn is_junk(path: &str) -> bool {
     let c: Vec<&str> = path.split('/').collect();
     c.iter().any(|x| x.eq_ignore_ascii_case("__MACOSX"))
@@ -360,7 +371,7 @@ fn plan_content<R: Read + Seek>(
 ) -> Result<Layout, NeedsReview> {
     let assets: Vec<&&EntryInfo> = files
         .iter()
-        .filter(|e| matches!(ext_of(&e.path).as_str(), "uasset" | "umap"))
+        .filter(|e| matches!(ext_of(&e.path).as_str(), "uasset" | "umap") && !in_ofpa(&e.path))
         .collect();
     if assets.is_empty() {
         return Err(NeedsReview::NoGameMatch);
@@ -426,6 +437,20 @@ fn plan_content<R: Read + Seek>(
     if resolved == 0 {
         return Err(NeedsReview::NoGameMatch);
     }
+    // A clear majority rule (at least 95% of the resolved assets) wins; the few outliers
+    // (an author's moved asset) count as unresolved. Any real root difference still shows
+    // up later as MULTI_ROOT.
+    if votes.len() > 1 {
+        let (top_key, top_n) = votes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.1))
+            .max_by_key(|(_, n)| *n)
+            .unwrap();
+        if top_n * 20 >= resolved * 19 {
+            unresolved += resolved - top_n;
+            votes.retain(|k, _| *k == top_key);
+        }
+    }
     if unresolved * 5 > assets.len() {
         return Err(NeedsReview::TooManyUnresolved {
             unresolved,
@@ -446,6 +471,7 @@ fn plan_content<R: Read + Seek>(
 
     let mut renames = Vec::new();
     let mut roots: BTreeSet<String> = BTreeSet::new();
+    let mut ofpa_roots: BTreeSet<String> = BTreeSet::new();
     let mut root_names: HashMap<String, String> = HashMap::new();
     for e in files {
         let rel: Option<Vec<&str>> = if zc.is_empty() {
@@ -455,7 +481,10 @@ fn plan_content<R: Read + Seek>(
         };
         let Some(rel) = rel else { continue };
         let mut out: Vec<&str> = vec!["Content"];
-        out.extend(gc.iter().copied());
+        let ofpa = rel.first().is_some_and(|c| is_ofpa_dir(c));
+        if !ofpa {
+            out.extend(gc.iter().copied());
+        }
         out.extend(rel.iter().copied());
         if out.len() == 2 {
             // A file directly in Content/.
@@ -465,6 +494,17 @@ fn plan_content<R: Read + Seek>(
                     e.path
                 )));
             }
+            continue;
+        }
+        if ofpa {
+            // Kept at Content/__ExternalActors__/... (relative position under Content),
+            // but never a content root.
+            ofpa_roots.insert(format!("Content/{}", out[1]));
+            renames.push(EntryRename {
+                index: e.index,
+                from: e.path.clone(),
+                to: out.join("/"),
+            });
             continue;
         }
         let low = out[1].to_lowercase();
@@ -489,7 +529,11 @@ fn plan_content<R: Read + Seek>(
         Kind::Content,
         rule.zip_prefix.clone(),
         rule.game_prefix.clone(),
-        vec![format!("Content/{folder}")],
+        {
+            let mut v = vec![format!("Content/{folder}")];
+            v.extend(ofpa_roots);
+            v
+        },
         renames,
         files.len(),
         &size_map(files),

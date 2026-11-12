@@ -463,10 +463,15 @@ impl Drop for TempDir {
     }
 }
 
+fn slot_name(i: usize) -> String {
+    format!("f{i:06}")
+}
+
 fn rar_to_zip(first: &Path, library_dir: &Path, tmp_zip: &Path) -> Result<(), SanitizeError> {
     // Pass 1: list and validate every header before anything is written.
     let mut caps = Caps::default();
     let mut files: Vec<String> = Vec::new();
+    let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for h in Archive::new(first).open_for_listing().map_err(map_rar)? {
         let h = h.map_err(map_rar)?;
         let raw = h.filename.to_string_lossy().to_string();
@@ -478,12 +483,15 @@ fn rar_to_zip(first: &Path, library_dir: &Path, tmp_zip: &Path) -> Result<(), Sa
         }
         let path = caps.admit(&raw, h.is_directory(), h.unpacked_size)?;
         if !h.is_directory() {
+            slot_of.insert(path.clone(), files.len());
             files.push(path);
         }
     }
     caps.finish()?;
 
-    // Pass 2: extract under names we chose (never the archive's own paths).
+    // Pass 2: extract under short sequential names (`f000001`): unrar uses Win32 paths that
+    // fail on >260 characters or non-ASCII names, so the real (validated) entry name is only
+    // applied when the file is written into the output zip.
     let dir = TempDir(library_dir.join(format!(".tmp-{}", &unique_token()[..8])));
     fs::create_dir_all(&dir.0)?;
     let mut cur = Some(Archive::new(first).open_for_processing().map_err(map_rar)?);
@@ -498,10 +506,10 @@ fn rar_to_zip(first: &Path, library_dir: &Path, tmp_zip: &Path) -> Result<(), Sa
         }
         let raw = h.entry().filename.to_string_lossy().to_string();
         let path = normalize_name(&raw).map_err(SanitizeError::NeedsReview)?;
-        let dest = dir.0.join(&path);
-        if let Some(p) = dest.parent() {
-            fs::create_dir_all(p)?;
-        }
+        let Some(slot) = slot_of.get(&path) else {
+            return Err(corrupt(format!("{path}: entry not in the header listing")));
+        };
+        let dest = dir.0.join(slot_name(*slot));
         cur = Some(h.extract_to(&dest).map_err(map_rar)?);
         let md = fs::symlink_metadata(&dest)?;
         if md.file_type().is_symlink() {
@@ -514,8 +522,8 @@ fn rar_to_zip(first: &Path, library_dir: &Path, tmp_zip: &Path) -> Result<(), Sa
     }
 
     let mut zw = ZipWriter::new(BufWriter::with_capacity(1 << 20, File::create(tmp_zip)?));
-    for path in &files {
-        let src = dir.0.join(path);
+    for (slot, path) in files.iter().enumerate() {
+        let src = dir.0.join(slot_name(slot));
         let md = fs::symlink_metadata(&src)
             .map_err(|_| corrupt(format!("{path}: not extracted (damaged rar?)")))?;
         if md.file_type().is_symlink() {
