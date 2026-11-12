@@ -7,7 +7,7 @@ use zip::ZipArchive;
 
 pub const MAX_ENTRIES: usize = 200_000;
 pub const MAX_UNCOMPRESSED: u64 = 50 * 1024 * 1024 * 1024;
-pub const MAX_PATH_LEN: usize = 200;
+pub const MAX_PATH_LEN: usize = 400;
 
 /// One validated archive entry with a normalised, `/`-separated relative path.
 #[derive(Clone, Debug)]

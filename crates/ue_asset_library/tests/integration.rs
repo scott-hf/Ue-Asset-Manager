@@ -465,7 +465,7 @@ fn rejects_backslash_slip_and_long_paths() {
         needs_review(&src, &lib),
         NeedsReview::Unsafe { .. }
     ));
-    let long = format!("P/{}/x.uasset", "d".repeat(210));
+    let long = format!("P/{}/x.uasset", "d".repeat(410));
     let src = single_entry_zip(&t, &long);
     match needs_review(&src, &lib) {
         NeedsReview::Unsafe { code, .. } => assert_eq!(code, "PATH_TOO_LONG"),
