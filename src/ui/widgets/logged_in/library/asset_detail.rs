@@ -1,6 +1,5 @@
 use crate::models::asset_data::AssetType;
-use crate::ui::widgets::download_manager::asset::Asset;
-use crate::ui::widgets::logged_in::fab::version_dialog::EpicFabVersionDialog;
+use crate::ui::widgets::logged_in::download_dialog::EpicDownloadDialog;
 use diesel::dsl::exists;
 use diesel::{select, ExpressionMethods, QueryDsl, RunQueryDsl};
 use egs_api::api::types::asset_info::AssetInfo;
@@ -12,7 +11,7 @@ use gtk4::subclass::prelude::*;
 use gtk4::{self, gio, prelude::*};
 use gtk4::{glib, CompositeTemplate};
 use gtk_macros::{action, get_action};
-use log::{debug, info};
+use log::{debug, info, warn};
 
 pub mod imp {
     use super::*;
@@ -304,6 +303,18 @@ impl EpicAssetDetails {
 
         action!(
             actions,
+            "download",
+            clone!(
+                #[weak(rename_to=details)]
+                self,
+                move |_, _| {
+                    details.open_download_dialog();
+                }
+            )
+        );
+
+        action!(
+            actions,
             "create_project",
             clone!(
                 #[weak(rename_to=details)]
@@ -433,11 +444,7 @@ impl EpicAssetDetails {
         }
 
         if let Some(asset) = self.asset() {
-            self.create_actions_button(
-                "Download",
-                "folder-download-symbolic",
-                "details.show_download_details",
-            );
+            self.create_actions_button("Download", "folder-download-symbolic", "details.download");
 
             self.create_open_vault_button(&asset);
 
@@ -933,43 +940,30 @@ impl EpicAssetDetails {
         self_.favorite.set_icon_name("non-starred-symbolic");
     }
 
+    /// Ask which project and version to use before downloading a Fab asset.
     pub fn open_fab_version_dialog(&self, fab_asset: &FabAsset) {
         let self_ = self.imp();
-        debug!("Opening FAB version dialog for {}", fab_asset.title);
+        debug!("Opening download dialog for FAB asset {}", fab_asset.title);
 
-        let dialog = EpicFabVersionDialog::new();
+        match (self_.window.get(), self_.download_manager.get()) {
+            (Some(window), Some(dm)) => {
+                EpicDownloadDialog::present_fab(window, dm, fab_asset);
+            }
+            _ => warn!("Window or download manager not available for the download dialog"),
+        }
+    }
 
-        dialog.set_fab_asset(fab_asset);
-
-        let fab_asset_for_signal = fab_asset.clone();
-        dialog.connect_closure(
-            "version-selected",
-            false,
-            glib::closure_local!(
-                #[weak(rename_to=details)]
-                self,
-                move |_dialog: EpicFabVersionDialog, artifact_id: String, platform: String| {
-                    debug!(
-                        "FAB version selected: artifact_id={}, platform={}",
-                        artifact_id, platform
-                    );
-                    let self_ = details.imp();
-                    if let Some(dm) = self_.download_manager.get() {
-                        dm.add_fab_asset_download(
-                            fab_asset_for_signal.clone(),
-                            artifact_id,
-                            platform,
-                            &None,
-                        );
-                    }
-                }
-            ),
-        );
-
-        if let Some(window) = self_.window.get() {
-            adw::prelude::AdwDialogExt::present(&dialog, Some(window));
-        } else {
-            adw::prelude::AdwDialogExt::present(&dialog, gtk4::Widget::NONE);
+    /// Ask which project and version to use before downloading the Epic asset shown here.
+    pub fn open_download_dialog(&self) {
+        let self_ = self.imp();
+        let Some(asset) = self.asset() else {
+            return;
+        };
+        match (self_.window.get(), self_.download_manager.get()) {
+            (Some(window), Some(dm)) => {
+                EpicDownloadDialog::present_epic(window, dm, &asset);
+            }
+            _ => warn!("Window or download manager not available for the download dialog"),
         }
     }
 

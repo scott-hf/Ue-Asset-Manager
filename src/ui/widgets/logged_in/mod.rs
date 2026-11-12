@@ -3,6 +3,7 @@ use gtk4::subclass::prelude::*;
 use gtk4::{self, prelude::*};
 use gtk4::{glib, CompositeTemplate};
 
+pub mod download_dialog;
 pub mod engines;
 pub mod fab;
 pub mod games;

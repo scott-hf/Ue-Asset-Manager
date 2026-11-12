@@ -421,13 +421,9 @@ impl EpicLibraryBox {
                     "create_project" => {
                         self.open_create_project_dialog(asset_info);
                     }
-                    "download" => {
-                        // Start download directly using the first release
-                        self.start_asset_download(asset_info);
-                    }
-                    "add_to_project" => {
-                        // Open add to project dialog
-                        self.open_add_to_project_dialog(asset_info);
+                    "download" | "add_to_project" => {
+                        // Ask for the project and version before downloading
+                        self.open_download_dialog(asset_info);
                     }
                     "show_details" => {
                         // Open asset details panel
@@ -443,87 +439,19 @@ impl EpicLibraryBox {
         }
     }
 
-    fn start_asset_download(&self, asset_info: &egs_api::api::types::asset_info::AssetInfo) {
+    /// Ask which project and version to use before downloading an asset.
+    pub fn open_download_dialog(&self, asset_info: &egs_api::api::types::asset_info::AssetInfo) {
         let self_ = self.imp();
+        debug!("open_download_dialog called for: {:?}", asset_info.title);
 
-        debug!("start_asset_download called for: {:?}", asset_info.title);
-
-        // Get the first release to download
-        if let Some(release_info) = asset_info.release_info.as_ref() {
-            debug!("Found release_info with {} releases", release_info.len());
-            if let Some(first) = release_info.first() {
-                if let Some(release_id) = &first.app_id {
-                    debug!("Starting download for release_id: {}", release_id);
-
-                    // Start the download via download manager
-                    if let Some(dm) = self_.download_manager.get() {
-                        debug!("Got download manager, calling add_asset_download");
-                        use crate::ui::widgets::download_manager::asset::Asset;
-                        dm.add_asset_download(
-                            release_id.clone(),
-                            asset_info.clone(),
-                            &None, // Use default vault directory
-                            None,  // No special post-download actions
-                        );
-
-                        // Show the download manager
-                        if let Some(window) = self_.window.get() {
-                            debug!("Showing download manager");
-                            window.show_download_manager();
-                        }
-                    } else {
-                        warn!("Download manager not available");
-                    }
-                } else {
-                    warn!("No app_id in first release");
-                }
-            } else {
-                warn!("No releases found in release_info");
+        match (self_.window.get(), self_.download_manager.get()) {
+            (Some(window), Some(dm)) => {
+                crate::ui::widgets::logged_in::download_dialog::EpicDownloadDialog::present_epic(
+                    window, dm, asset_info,
+                );
             }
-        } else {
-            warn!("No release_info in asset: {:?}", asset_info.title);
+            _ => warn!("Window or download manager not available for the download dialog"),
         }
-    }
-
-    fn open_add_to_project_dialog(&self, asset_info: &egs_api::api::types::asset_info::AssetInfo) {
-        let self_ = self.imp();
-
-        let dialog = actions::EpicAddToProjectDialog::new();
-
-        // Set transient parent
-        if let Some(window) = self_.window.get() {
-            dialog.set_transient_for(Some(window));
-            dialog.set_window(window);
-        }
-
-        // Set download manager
-        if let Some(dm) = self_.download_manager.get() {
-            dialog.set_download_manager(dm);
-        }
-
-        // Set the asset
-        dialog.set_asset(asset_info);
-
-        // Connect to asset-added signal to show download manager
-        dialog.connect_local(
-            "asset-added",
-            false,
-            clone!(
-                #[weak(rename_to=library)]
-                self,
-                #[upgrade_or]
-                None,
-                move |_| {
-                    let self_ = library.imp();
-                    if let Some(window) = self_.window.get() {
-                        window.show_download_manager();
-                    }
-                    None
-                }
-            ),
-        );
-
-        dialog.present();
     }
 
     fn show_asset_details(&self, asset_info: &egs_api::api::types::asset_info::AssetInfo) {

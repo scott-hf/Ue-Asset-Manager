@@ -26,7 +26,8 @@ fn default_stale() -> u64 {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JobConfig {
-    /// Folder containing `unprocessed/` (and the other state folders). Must exist.
+    /// Inbox folder: zips dropped directly in it (and in an optional `unprocessed/`
+    /// subfolder) are processed; the state folders are created inside. Must exist.
     pub import: PathBuf,
     /// Library folder (created when missing).
     pub library: PathBuf,

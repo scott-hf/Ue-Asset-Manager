@@ -1,4 +1,4 @@
-//! Sanitizer service: turns zips dropped in `<import>/unprocessed/` into library entries.
+//! Sanitizer service: turns zips dropped in `<import>/` (or `<import>/unprocessed/`) into library entries.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -138,7 +138,7 @@ fn main() -> ExitCode {
             match r {
                 Ok(rep) => {
                     for l in &rep.loose_files {
-                        println!("[{label}] ignored non-zip file in unprocessed/: {l}");
+                        println!("[{label}] ignored non-zip file (left in place): {l}");
                     }
                     println!(
                         "[{label}] done: {} sanitized, {} duplicate, {} needs-review, {} failed, {} deferred, {} busy",
@@ -169,7 +169,7 @@ fn main() -> ExitCode {
             if let Ok(rep) = job.tick(&mut job_log) {
                 for l in rep.loose_files {
                     if !warned.contains(&(i, l.clone())) {
-                        job_log(&format!("ignored non-zip file in unprocessed/: {l}"));
+                        job_log(&format!("ignored non-zip file (left in place): {l}"));
                         warned.push((i, l));
                     }
                 }

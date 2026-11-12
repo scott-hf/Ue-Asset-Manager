@@ -618,18 +618,25 @@ fn claim_race_has_exactly_one_winner() {
     let t = Tmp::new();
     let dirs = Dirs::new(&t.dir("import"));
     dirs.create_all().unwrap();
+    fs::create_dir_all(&dirs.unprocessed).unwrap();
     for round in 0..25 {
         let name = format!("r{round}.zip");
-        fs::write(dirs.unprocessed.join(&name), b"x").unwrap();
+        // Alternate between the two inboxes: the import root and unprocessed/.
+        let src = if round % 2 == 0 {
+            dirs.root.join(&name)
+        } else {
+            dirs.unprocessed.join(&name)
+        };
+        fs::write(&src, b"x").unwrap();
         let barrier = Arc::new(Barrier::new(4));
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let d = dirs.clone();
                 let b = barrier.clone();
-                let n = name.clone();
+                let s = src.clone();
                 std::thread::spawn(move || {
                     b.wait();
-                    matches!(try_claim(&d, &n), ClaimResult::Claimed(_))
+                    matches!(try_claim(&d, &s), ClaimResult::Claimed(_))
                 })
             })
             .collect();
@@ -640,7 +647,7 @@ fn claim_race_has_exactly_one_winner() {
             .count();
         assert_eq!(wins, 1, "round {round}");
         assert!(dirs.processing.join(&name).is_file());
-        assert!(!dirs.unprocessed.join(&name).exists());
+        assert!(!src.exists());
     }
 }
 
@@ -653,19 +660,18 @@ fn pipeline_moves_zips_to_the_right_folders() {
     cfg.stable_secs = 0;
     let dirs = Dirs::new(&import);
     dirs.create_all().unwrap();
-    op_room_zip(&dirs.unprocessed.join("Good 5.0.zip"));
+    fs::create_dir_all(&dirs.unprocessed).unwrap();
+    // Good + copy sit in the import root, Bad in the legacy unprocessed/ folder.
+    op_room_zip(&import.join("Good 5.0.zip"));
     make_zip(
         &dirs.unprocessed.join("Bad.zip"),
         &[("P/readme.txt", vec![1])],
     );
-    fs::write(dirs.unprocessed.join("half.zip.part"), b"x").unwrap();
-    fs::write(dirs.unprocessed.join("notes.txt"), b"x").unwrap();
+    fs::write(import.join("half.zip.part"), b"x").unwrap();
+    fs::write(import.join("notes.txt"), b"x").unwrap();
+    fs::write(dirs.unprocessed.join("loose.uasset"), b"x").unwrap();
     // Same content dropped under another name.
-    fs::copy(
-        dirs.unprocessed.join("Good 5.0.zip"),
-        dirs.unprocessed.join("Good copy.zip"),
-    )
-    .unwrap();
+    fs::copy(import.join("Good 5.0.zip"), import.join("Good copy.zip")).unwrap();
 
     let mut lines = Vec::new();
     let rep = run_once(&cfg, &mut |l| lines.push(l.to_string()));
@@ -673,11 +679,23 @@ fn pipeline_moves_zips_to_the_right_folders() {
     assert_eq!(rep.duplicates.len(), 1, "{lines:?}");
     assert_eq!(rep.needs_review, vec!["Bad.zip".to_string()]);
     assert_eq!(rep.exit_code(), 2);
-    assert_eq!(rep.loose_files, vec!["notes.txt".to_string()]);
+    let mut loose = rep.loose_files.clone();
+    loose.sort();
+    assert_eq!(
+        loose,
+        vec![
+            "notes.txt".to_string(),
+            "unprocessed/loose.uasset".to_string()
+        ]
+    );
+    assert!(
+        dirs.unprocessed.join("loose.uasset").is_file() && import.join("notes.txt").is_file(),
+        "loose files stay in place"
+    );
     assert!(dirs.needs_review.join("Bad.zip").is_file());
     assert!(dirs.needs_review.join("Bad.zip.review.json").is_file());
     assert!(
-        dirs.unprocessed.join("half.zip.part").is_file(),
+        import.join("half.zip.part").is_file(),
         ".part files are left alone"
     );
     assert_eq!(
@@ -741,8 +759,100 @@ fn crash_leftovers_are_reconciled() {
 
     cfg.requeue = true;
     reconcile(&cfg);
-    assert!(dirs.unprocessed.join("stuck.zip").is_file());
+    assert!(
+        dirs.root.join("stuck.zip").is_file(),
+        "stale claims go back to the import root"
+    );
     assert!(!dirs.processing.join("stuck.zip.claim").exists());
+}
+
+fn count_zips(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".zip"))
+        .count()
+}
+
+#[test]
+fn zip_in_import_root_is_claimed_and_ends_in_processed() {
+    let t = Tmp::new();
+    let import = t.dir("import");
+    let lib = t.dir("library");
+    let mut cfg = Config::new(&import, &lib);
+    cfg.stable_secs = 0;
+    op_room_zip(&import.join("Dropped 5.0.zip"));
+    let mut lines = Vec::new();
+    let rep = run_once(&cfg, &mut |l| lines.push(l.to_string()));
+    assert_eq!(
+        rep.sanitized,
+        vec!["Dropped 5.0.zip".to_string()],
+        "{lines:?}"
+    );
+    let dirs = Dirs::new(&import);
+    assert!(!import.join("Dropped 5.0.zip").exists());
+    assert!(dirs.processed.join("Dropped 5.0.zip").is_file());
+    assert_eq!(count_zips(&dirs.processing), 0);
+    assert_eq!(scan_library(&lib).len(), 1);
+    assert!(
+        !dirs.unprocessed.exists(),
+        "unprocessed/ is optional and never created"
+    );
+    // Second pass with nothing new: the state folders are not mistaken for inboxes.
+    let rep = run_once(&cfg, &mut |_| {});
+    assert!(rep.sanitized.is_empty() && rep.duplicates.is_empty());
+}
+
+#[test]
+fn zip_in_unprocessed_still_works() {
+    let t = Tmp::new();
+    let import = t.dir("import");
+    let lib = t.dir("library");
+    let mut cfg = Config::new(&import, &lib);
+    cfg.stable_secs = 0;
+    let dirs = Dirs::new(&import);
+    fs::create_dir_all(&dirs.unprocessed).unwrap();
+    op_room_zip(&dirs.unprocessed.join("Legacy 5.0.zip"));
+    let rep = run_once(&cfg, &mut |_| {});
+    assert_eq!(rep.sanitized.len(), 1);
+    assert!(!dirs.unprocessed.join("Legacy 5.0.zip").exists());
+    assert!(dirs.processed.join("Legacy 5.0.zip").is_file());
+}
+
+#[test]
+fn same_name_in_both_inboxes_does_not_clobber() {
+    let t = Tmp::new();
+    let import = t.dir("import");
+    let lib = t.dir("library");
+    let mut cfg = Config::new(&import, &lib);
+    cfg.stable_secs = 0;
+    let dirs = Dirs::new(&import);
+    fs::create_dir_all(&dirs.unprocessed).unwrap();
+    op_room_zip(&import.join("Pack.zip"));
+    make_zip(
+        &dirs.unprocessed.join("Pack.zip"),
+        &[(
+            "Other/Levels/Z.umap",
+            fake_asset("/Game/Other/Levels/Z", &[]),
+        )],
+    );
+    let mut lines = Vec::new();
+    let rep = run_once(&cfg, &mut |l| lines.push(l.to_string()));
+    // Either both are handled in one pass or the second one in the next pass.
+    let mut total = rep.sanitized.len();
+    if total < 2 {
+        total += run_once(&cfg, &mut |_| {}).sanitized.len();
+    }
+    assert_eq!(total, 2, "{lines:?}");
+    assert_eq!(scan_library(&lib).len(), 2);
+    assert_eq!(
+        count_zips(&dirs.processed),
+        2,
+        "both originals preserved in processed/"
+    );
+    assert_eq!(count_zips(&import), 0);
+    assert_eq!(count_zips(&dirs.unprocessed), 0);
+    assert_eq!(count_zips(&dirs.processing), 0);
 }
 
 // ---------- import ----------

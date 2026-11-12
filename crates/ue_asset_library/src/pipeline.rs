@@ -1,7 +1,9 @@
 //! The import-folder pipeline: claims, startup reconcile and sanitize passes.
 //!
-//! Folders under the import root: `unprocessed` (the inbox, the only folder
-//! scanned), `processing`, `needs-review`, `failed`, `processed`.
+//! The inbox is the zips lying directly in the import root plus the zips in its
+//! optional `unprocessed/` subfolder (kept for compatibility). State folders under the
+//! import root: `processing`, `needs-review`, `failed`, `processed` (subfolders are
+//! never scanned as inboxes).
 
 use crate::error::{NeedsReview, SanitizeError};
 use crate::sanitize::{sanitize_zip, SanitizeOutcome};
@@ -67,9 +69,14 @@ impl Dirs {
         }
     }
 
+    /// Inbox folders that are scanned: the import root and `unprocessed/`.
+    pub fn inboxes(&self) -> [&Path; 2] {
+        [&self.root, &self.unprocessed]
+    }
+
+    /// Create the state folders (`unprocessed/` is optional and never created).
     pub fn create_all(&self) -> std::io::Result<()> {
         for d in [
-            &self.unprocessed,
             &self.processing,
             &self.needs_review,
             &self.failed,
@@ -87,6 +94,8 @@ pub struct Claim {
     pub claim_path: PathBuf,
     /// Location of the zip inside `processing/`.
     pub zip_path: PathBuf,
+    /// The inbox folder the zip came from (where a deferred zip is put back).
+    pub origin: PathBuf,
 }
 
 #[derive(Debug)]
@@ -98,11 +107,20 @@ pub enum ClaimResult {
     Busy(String),
 }
 
-/// Claim `unprocessed/<name>`: create `processing/<name>.claim` exclusively, then
-/// rename the zip into `processing/`. Exactly one concurrent caller wins.
-pub fn try_claim(dirs: &Dirs, name: &str) -> ClaimResult {
+/// Claim an inbox zip: create `processing/<name>.claim` exclusively, then rename the
+/// zip into `processing/`. Exactly one concurrent caller wins. Two inbox zips with the
+/// same name are handled one after the other (the claim is per name), never clobbered.
+pub fn try_claim(dirs: &Dirs, src: &Path) -> ClaimResult {
+    let Some(name) = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|_| src.parent().is_some())
+    else {
+        return ClaimResult::Taken;
+    };
+    let name = name.as_str();
+    let origin = src.parent().map(Path::to_path_buf).unwrap_or_default();
     let claim_path = dirs.processing.join(format!("{name}.claim"));
-    let src = dirs.unprocessed.join(name);
     if !src.exists() {
         return ClaimResult::Taken;
     }
@@ -132,11 +150,17 @@ pub fn try_claim(dirs: &Dirs, name: &str) -> ClaimResult {
     let _ = f.sync_all();
     drop(f);
     let dst = dirs.processing.join(name);
-    match fs::rename(&src, &dst) {
+    if dst.exists() {
+        // rename would overwrite on some platforms; never clobber a zip being processed.
+        let _ = fs::remove_file(&claim_path);
+        return ClaimResult::Busy(format!("{name} already exists in processing/"));
+    }
+    match fs::rename(src, &dst) {
         Ok(()) => ClaimResult::Claimed(Claim {
             name: name.to_string(),
             claim_path,
             zip_path: dst,
+            origin,
         }),
         Err(e) => {
             let _ = fs::remove_file(&claim_path);
@@ -192,7 +216,8 @@ impl PassReport {
 
 #[derive(Default, Debug)]
 pub struct State {
-    seen: HashMap<String, (u64, Option<SystemTime>, Instant)>,
+    /// Stability tracking keyed by full path (the same name can sit in both inboxes).
+    seen: HashMap<PathBuf, (u64, Option<SystemTime>, Instant)>,
     attempts: HashMap<String, u32>,
 }
 
@@ -209,39 +234,52 @@ pub fn run_pass(cfg: &Config, state: &mut State, log: &mut dyn FnMut(&str)) -> P
         rep.busy.push(format!("import folders: {e}"));
         return rep;
     }
-    let Ok(rd) = fs::read_dir(&dirs.unprocessed) else {
-        log("cannot read unprocessed folder");
-        return rep;
-    };
-    let mut names: Vec<(String, u64, Option<SystemTime>)> = Vec::new();
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let lower = name.to_ascii_lowercase();
-        let Ok(md) = e.metadata() else { continue };
-        if md.is_dir() {
-            continue;
+    // Inboxes: the import root itself and the optional unprocessed/ subfolder.
+    let mut found: Vec<(PathBuf, String, u64, Option<SystemTime>)> = Vec::new();
+    for (i, inbox) in dirs.inboxes().into_iter().enumerate() {
+        let rd = match fs::read_dir(inbox) {
+            Ok(rd) => rd,
+            Err(e) => {
+                // unprocessed/ is optional; the import root itself must be readable.
+                if i == 0 {
+                    log(&format!("cannot read import folder: {e}"));
+                    rep.busy.push(format!("import folder: {e}"));
+                }
+                continue;
+            }
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let lower = name.to_ascii_lowercase();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                continue;
+            }
+            if lower.ends_with(".part") || lower.ends_with(".tmp") || lower.ends_with(".claim") {
+                continue;
+            }
+            if !lower.ends_with(".zip") {
+                rep.loose_files.push(if i == 0 {
+                    name
+                } else {
+                    format!("unprocessed/{name}")
+                });
+                continue;
+            }
+            found.push((e.path(), name, md.len(), md.modified().ok()));
         }
-        if lower.ends_with(".part") || lower.ends_with(".tmp") || lower.ends_with(".claim") {
-            continue;
-        }
-        if !lower.ends_with(".zip") {
-            rep.loose_files.push(name);
-            continue;
-        }
-        names.push((name, md.len(), md.modified().ok()));
     }
-    names.sort();
-    let current: Vec<String> = names.iter().map(|n| n.0.clone()).collect();
-    state.seen.retain(|k, _| current.contains(k));
+    found.sort();
+    state.seen.retain(|k, _| found.iter().any(|f| &f.0 == k));
 
-    for (name, size, mtime) in names {
+    for (path, name, size, mtime) in found {
         let now = Instant::now();
-        let stable = match state.seen.get(&name) {
+        let stable = match state.seen.get(&path) {
             Some((s, m, since)) if *s == size && *m == mtime => {
                 now.duration_since(*since) >= Duration::from_secs(cfg.stable_secs)
             }
             _ => {
-                state.seen.insert(name.clone(), (size, mtime, now));
+                state.seen.insert(path.clone(), (size, mtime, now));
                 cfg.stable_secs == 0
             }
         };
@@ -249,7 +287,7 @@ pub fn run_pass(cfg: &Config, state: &mut State, log: &mut dyn FnMut(&str)) -> P
             rep.pending_unstable += 1;
             continue;
         }
-        match try_claim(&dirs, &name) {
+        match try_claim(&dirs, &path) {
             ClaimResult::Taken => {}
             ClaimResult::Busy(why) => {
                 log(&format!("{name}: busy ({why}), will retry"));
@@ -257,7 +295,7 @@ pub fn run_pass(cfg: &Config, state: &mut State, log: &mut dyn FnMut(&str)) -> P
             }
             ClaimResult::Claimed(claim) => {
                 log(&format!("{name}: claimed, sanitizing"));
-                state.seen.remove(&name);
+                state.seen.remove(&path);
                 process_claim(cfg, &dirs, state, claim, &mut rep, log);
             }
         }
@@ -326,7 +364,7 @@ fn process_claim(
                 log(&format!(
                     "{name}: not readable yet ({m}); attempt {n}, putting back"
                 ));
-                match fs::rename(&claim.zip_path, dirs.unprocessed.join(&name)) {
+                match fs::rename(&claim.zip_path, claim.origin.join(&name)) {
                     Ok(()) => {
                         let _ = fs::remove_file(&claim.claim_path);
                     }
@@ -495,7 +533,7 @@ pub fn reconcile(cfg: &Config) -> Vec<String> {
                 }
             } else if age >= stale_secs {
                 if cfg.requeue {
-                    match move_unique(&zip_here, &dirs.unprocessed, zip_name) {
+                    match move_unique(&zip_here, &dirs.root, zip_name) {
                         Ok(_) => {
                             let _ = fs::remove_file(&claim_path);
                             actions.push(format!("stale claim requeued: {zip_name}"));
@@ -518,7 +556,7 @@ pub fn reconcile(cfg: &Config) -> Vec<String> {
             let age = age_secs(&e.path()).unwrap_or(0);
             if age >= stale_secs && name.to_ascii_lowercase().ends_with(".zip") {
                 if cfg.requeue {
-                    if move_unique(&e.path(), &dirs.unprocessed, &name).is_ok() {
+                    if move_unique(&e.path(), &dirs.root, &name).is_ok() {
                         actions.push(format!("unclaimed zip in processing requeued: {name}"));
                     }
                 } else {

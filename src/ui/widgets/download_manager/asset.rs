@@ -135,6 +135,7 @@ pub trait Asset {
         _artifact_id: String,
         _platform: String,
         _target: &Option<String>,
+        _actions: Option<Vec<PostDownloadAction>>,
     ) {
         unimplemented!()
     }
@@ -226,7 +227,23 @@ impl Asset for super::EpicDownloadManager {
         );
         item.set_property("asset", asset.id.clone());
         item.set_property("release", release_id.clone());
-        item.set_property("label", asset.title.clone());
+        let engines = asset
+            .release_info
+            .as_ref()
+            .and_then(|r| {
+                r.iter()
+                    .find(|ri| ri.app_id.as_deref() == Some(release_id.as_str()))
+            })
+            .and_then(|ri| ri.compatible_apps.clone())
+            .map(|apps| apps.join(", ").replace("UE_", ""))
+            .filter(|e| !e.is_empty());
+        item.set_property(
+            "label",
+            match (&asset.title, engines) {
+                (Some(t), Some(e)) => Some(format!("{t} (UE {e})")),
+                (t, _) => t.clone(),
+            },
+        );
         item.set_property("target", target.clone());
         item.set_property("status", "initializing...".to_string());
         self.load_thumbnail(release_id.clone(), asset.thumbnail());
@@ -946,6 +963,7 @@ impl Asset for super::EpicDownloadManager {
         artifact_id: String,
         platform: String,
         target: &Option<String>,
+        actions: Option<Vec<PostDownloadAction>>,
     ) {
         debug!("Adding FAB download: {}", fab_asset.title);
         let self_ = self.imp();
@@ -969,13 +987,28 @@ impl Asset for super::EpicDownloadManager {
             item.set_window(w);
         }
         item.set_download_manager(self);
+        if let Some(actions) = actions {
+            item.add_actions(&actions);
+        };
         item.set_property(
             "item-type",
             crate::ui::widgets::download_manager::download_item::ItemType::Asset,
         );
         item.set_property("asset", asset_id.clone());
         item.set_property("release", artifact_id.clone());
-        item.set_property("label", fab_asset.title.clone());
+        let engines = fab_asset
+            .project_versions
+            .iter()
+            .find(|pv| pv.artifact_id == artifact_id)
+            .map(|pv| pv.engine_versions.join(", ").replace("UE_", ""))
+            .filter(|e| !e.is_empty());
+        item.set_property(
+            "label",
+            match engines {
+                Some(e) => format!("{} (UE {})", fab_asset.title, e),
+                None => fab_asset.title.clone(),
+            },
+        );
         item.set_property("target", target.clone());
         item.set_property("status", "initializing...".to_string());
 

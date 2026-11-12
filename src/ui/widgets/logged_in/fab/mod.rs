@@ -5,7 +5,6 @@ use gtk4::{glib, CompositeTemplate};
 use log::{debug, error, warn};
 use std::path::PathBuf;
 
-pub mod version_dialog;
 
 pub mod imp {
     use super::*;

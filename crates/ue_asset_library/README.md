@@ -5,7 +5,8 @@ No GTK; the app crate depends on the library for scanning and importing.
 
 ## What the sanitizer does
 
-Zips dropped into a job's `<import>/unprocessed/` folder are checked (path hardening,
+Zips dropped directly into a job's `<import>/` folder (or into an optional
+`<import>/unprocessed/` subfolder, kept for compatibility) are checked (path hardening,
 size caps), classified (Content / Plugin / Project), rewritten to the layout Unreal
 expects (`Content/<Folder>/...` or `Plugins/<Name>/...`, build output removed) and stored
 in the job's library folder as `<slug>.<sha12>.zip` plus a `<slug>.<sha12>.zip.json`
@@ -16,8 +17,9 @@ deleted, only moved between state folders.
 
 | Folder | Meaning |
 | --- | --- |
-| `unprocessed/` | The inbox, the only folder scanned. `*.part`, `*.tmp`, `*.claim` and non-zips are ignored. A zip is picked up once its size and modified time stay unchanged for `stable_secs`. |
-| `processing/` | A zip being worked on, next to a `<name>.claim` file (host, pid, start time). Exactly one process wins a claim. |
+| `<import>/` itself | The inbox. Zips lying directly here are picked up once their size and modified time stay unchanged for `stable_secs`. Subfolders are never treated as inboxes. `*.part`, `*.tmp`, `*.claim` are ignored; other non-zip files (e.g. a loose `.uasset`) are reported and left in place. |
+| `unprocessed/` | Optional second inbox (compatibility). Missing or empty is fine; it is never created. |
+| `processing/` | A zip being worked on, next to a `<name>.claim` file (host, pid, start time). Exactly one process wins a claim. Two zips with the same name in both inboxes are handled one after the other; `processed/` keeps both (a unique suffix is added). |
 | `processed/` | Done (also duplicates of an already stored zip, with a `.duplicate.txt` note). |
 | `needs-review/` | Not safe or not unambiguous (multi-root, no `/Game/` match, `..` paths, case collisions, ...). A `<name>.review.json` explains why. |
 | `failed/` | Unreadable or still truncated after 3 attempts, with a `.error.txt`. |
@@ -25,7 +27,7 @@ deleted, only moved between state folders.
 At startup each job is reconciled after a crash: old `library/.tmp-*` files are removed, a
 library zip without sidecar goes to `needs-review/`, and claims with no zip are dropped.
 A zip stuck in `processing/` longer than `stale_mins` is reported; `--requeue` moves it
-back to `unprocessed/`.
+back to the import root.
 
 ## Config: `sanitizer.json`
 

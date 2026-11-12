@@ -130,7 +130,9 @@ fn multiple_jobs_run_independently() {
     let (i2, l2) = (t.dir("two_import"), t.0.join("two_library"));
     Dirs::new(&i1).create_all().unwrap();
     Dirs::new(&i2).create_all().unwrap();
-    drop_zip(&Dirs::new(&i1).unprocessed, "Alpha 5.1.zip", "Alpha");
+    // Job one drops into the import root, job two into the legacy unprocessed/ folder.
+    drop_zip(&i1, "Alpha 5.1.zip", "Alpha");
+    fs::create_dir_all(&Dirs::new(&i2).unprocessed).unwrap();
     drop_zip(&Dirs::new(&i2).unprocessed, "Beta 5.2.zip", "Beta");
     let json = format!(
         "{{\"jobs\":[{},{}],\"stable_secs\":0}}",
@@ -164,7 +166,7 @@ fn bad_jobs_do_not_stop_the_others() {
     let good_i = t.dir("good_import");
     let good_l = t.0.join("good_library");
     Dirs::new(&good_i).create_all().unwrap();
-    drop_zip(&Dirs::new(&good_i).unprocessed, "Gamma 5.3.zip", "Gamma");
+    drop_zip(&good_i, "Gamma 5.3.zip", "Gamma");
     // Job 0: import folder does not exist (unreachable share). Job 2: library path is a file.
     let missing = t.0.join("no_such_import");
     let blocked_i = t.dir("blocked_import");
@@ -216,15 +218,7 @@ fn watch_tick_recovers_when_a_job_becomes_available() {
         "logged once: {lines:?}"
     );
     fs::create_dir_all(&import).unwrap();
-    drop_zip(
-        &{
-            let d = Dirs::new(&import);
-            d.create_all().unwrap();
-            d.unprocessed
-        },
-        "Delta 5.4.zip",
-        "Delta",
-    );
+    drop_zip(&import, "Delta 5.4.zip", "Delta");
     let rep = job.tick(&mut |l| lines.push(l.to_string())).unwrap();
     assert_eq!(rep.sanitized.len(), 1, "{lines:?}");
     assert!(lines.iter().any(|l| l.contains("available again")));
