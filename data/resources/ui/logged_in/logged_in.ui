@@ -57,6 +57,16 @@
                     </object>
                 </child>
 
+                <!-- LOCAL LIBRARY PAGE -->
+                <child>
+                    <object class="GtkStackPage">
+                        <property name="name">local_library</property>
+                        <property name="child">
+                            <object class="EpicLocalLibraryBox" id="local_library"/>
+                        </property>
+                    </object>
+                </child>
+
                 <!-- GAMES PAGE -->
                 <child>
                     <object class="GtkStackPage">

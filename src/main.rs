@@ -11,8 +11,8 @@ mod window;
 use crate::config::{GETTEXT_PACKAGE, LOCALEDIR, PKGDATADIR, PROFILE, RESOURCES_FILE, VERSION};
 use application::EpicAssetManager;
 use env_logger::Env;
-use gettextrs::{bindtextdomain, setlocale, textdomain, LocaleCategory};
 #[cfg(target_os = "linux")]
+use gettextrs::{bindtextdomain, setlocale, textdomain, LocaleCategory};
 use gtk4::gio;
 use log::debug;
 use std::io::Write;

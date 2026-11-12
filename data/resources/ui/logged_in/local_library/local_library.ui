@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+    <requires lib="gtk" version="4.0"/>
+    <template class="EpicLocalLibraryBox" parent="GtkBox">
+        <property name="hexpand">true</property>
+        <property name="vexpand">true</property>
+        <property name="orientation">vertical</property>
+        <property name="css-classes">view</property>
+
+        <!-- Header -->
+        <child>
+            <object class="GtkBox">
+                <property name="css-classes">section-header</property>
+                <property name="spacing">8</property>
+                <property name="margin-start">16</property>
+                <property name="margin-end">16</property>
+                <property name="margin-top">12</property>
+                <property name="margin-bottom">8</property>
+                <child>
+                    <object class="GtkLabel">
+                        <property name="label" translatable="yes">LOCAL LIBRARY</property>
+                        <property name="css-classes">section-title</property>
+                        <property name="halign">start</property>
+                    </object>
+                </child>
+                <child>
+                    <object class="GtkLabel" id="count_label">
+                        <property name="css-classes">section-count</property>
+                        <property name="halign">start</property>
+                        <property name="hexpand">true</property>
+                    </object>
+                </child>
+                <child>
+                    <object class="GtkSearchEntry" id="search_entry">
+                        <property name="placeholder-text" translatable="yes">Search local library...</property>
+                    </object>
+                </child>
+                <child>
+                    <object class="GtkButton" id="refresh_button">
+                        <property name="icon-name">view-refresh-symbolic</property>
+                        <property name="tooltip-text" translatable="yes">Rescan local library directories</property>
+                    </object>
+                </child>
+            </object>
+        </child>
+
+        <child>
+            <object class="GtkBox">
+                <property name="orientation">horizontal</property>
+                <property name="vexpand">true</property>
+                <property name="hexpand">true</property>
+
+                <!-- List / empty state -->
+                <child>
+                    <object class="GtkStack" id="content_stack">
+                        <property name="hexpand">true</property>
+                        <property name="vexpand">true</property>
+                        <child>
+                            <object class="GtkStackPage">
+                                <property name="name">list</property>
+                                <property name="child">
+                                    <object class="GtkScrolledWindow">
+                                        <property name="hexpand">true</property>
+                                        <property name="vexpand">true</property>
+                                        <property name="hscrollbar-policy">never</property>
+                                        <property name="child">
+                                            <object class="GtkListView" id="list_view">
+                                                <property name="margin-start">12</property>
+                                                <property name="margin-end">12</property>
+                                                <property name="margin-top">8</property>
+                                                <property name="margin-bottom">8</property>
+                                                <property name="css-classes">rich-list</property>
+                                            </object>
+                                        </property>
+                                    </object>
+                                </property>
+                            </object>
+                        </child>
+                        <child>
+                            <object class="GtkStackPage">
+                                <property name="name">empty</property>
+                                <property name="child">
+                                    <object class="AdwStatusPage" id="empty_page">
+                                        <property name="icon-name">folder-symbolic</property>
+                                        <property name="title" translatable="yes">No local library configured</property>
+                                        <property name="description" translatable="yes">Add a Local Library directory in the preferences to see sanitized asset zips here.</property>
+                                    </object>
+                                </property>
+                            </object>
+                        </child>
+                    </object>
+                </child>
+
+                <child>
+                    <object class="GtkSeparator" id="detail_separator">
+                        <property name="visible">false</property>
+                    </object>
+                </child>
+
+                <!-- Detail pane -->
+                <child>
+                    <object class="GtkScrolledWindow" id="detail_scroll">
+                        <property name="visible">false</property>
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="width-request">320</property>
+                        <property name="child">
+                            <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">8</property>
+                                <property name="margin-start">16</property>
+                                <property name="margin-end">16</property>
+                                <property name="margin-top">16</property>
+                                <property name="margin-bottom">16</property>
+                                <child>
+                                    <object class="GtkLabel" id="detail_name">
+                                        <property name="css-classes">title-2</property>
+                                        <property name="halign">start</property>
+                                        <property name="xalign">0</property>
+                                        <property name="wrap">true</property>
+                                        <property name="selectable">true</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkLabel" id="detail_kind">
+                                        <property name="css-classes">fab-badge</property>
+                                        <property name="halign">start</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkLabel" id="detail_info">
+                                        <property name="halign">start</property>
+                                        <property name="xalign">0</property>
+                                        <property name="wrap">true</property>
+                                        <property name="wrap-mode">word-char</property>
+                                        <property name="selectable">true</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkLabel" id="detail_warning">
+                                        <property name="css-classes">warning</property>
+                                        <property name="halign">start</property>
+                                        <property name="xalign">0</property>
+                                        <property name="wrap">true</property>
+                                        <property name="wrap-mode">word-char</property>
+                                        <property name="visible">false</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkBox" id="fab_box">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">6</property>
+                                        <property name="visible">false</property>
+                                        <child>
+                                            <object class="GtkLabel">
+                                                <property name="label" translatable="yes">FAB LISTING</property>
+                                                <property name="css-classes">section-title</property>
+                                                <property name="halign">start</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkPicture" id="fab_picture">
+                                                <property name="width-request">240</property>
+                                                <property name="height-request">135</property>
+                                                <property name="content-fit">contain</property>
+                                                <property name="visible">false</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkLabel" id="fab_title">
+                                                <property name="halign">start</property>
+                                                <property name="xalign">0</property>
+                                                <property name="wrap">true</property>
+                                                <property name="css-classes">heading</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkLinkButton" id="fab_link">
+                                                <property name="label" translatable="yes">Open on Fab</property>
+                                                <property name="halign">start</property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkButton" id="match_button">
+                                        <property name="label" translatable="yes">Match on Fab</property>
+                                        <property name="visible">false</property>
+                                        <property name="margin-top">8</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkButton" id="clear_match_button">
+                                        <property name="label" translatable="yes">Clear match</property>
+                                        <property name="visible">false</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkButton" id="import_button">
+                                        <property name="label" translatable="yes">Import to project</property>
+                                        <property name="css-classes">suggested-action</property>
+                                        <property name="margin-top">8</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkButton" id="new_project_button">
+                                        <property name="label" translatable="yes">Create new project</property>
+                                        <property name="css-classes">suggested-action</property>
+                                        <property name="margin-top">8</property>
+                                        <property name="visible">false</property>
+                                    </object>
+                                </child>
+                            </object>
+                        </property>
+                    </object>
+                </child>
+            </object>
+        </child>
+    </template>
+</interface>

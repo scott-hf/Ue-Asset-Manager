@@ -1,0 +1,17 @@
+[package]
+name = "ue_asset_library"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+description = "Sanitizer and importer for locally stored Unreal Engine asset zips"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zip = "8"
+
+[[bin]]
+name = "ue_asset_sanitizer"
+path = "src/bin/ue_asset_sanitizer.rs"

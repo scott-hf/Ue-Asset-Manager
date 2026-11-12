@@ -91,5 +91,19 @@
                 </child>
             </object>
         </child>
+        <child>
+            <object class="GtkButton">
+                <property name="halign">center</property>
+                <property name="margin-top">12</property>
+                <property name="action-name">sid.offline</property>
+                <property name="css-classes">flat</property>
+                <child>
+                    <object class="AdwButtonContent">
+                        <property name="icon-name">drive-harddisk-symbolic</property>
+                        <property name="label" translatable="yes">Open the local library without logging in</property>
+                    </object>
+                </child>
+            </object>
+        </child>
     </template>
 </interface>

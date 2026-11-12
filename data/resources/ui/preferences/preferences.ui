@@ -175,6 +175,31 @@
                         </child>
                         <child>
                             <object class="AdwExpanderRow">
+                                <property name="title" translatable="yes">Local Library Directories</property>
+                                <child>
+                                    <object class="GtkBox" id="local_library_directories_box">
+                                        <property name="orientation">vertical</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkButton">
+                                        <property name="action-name">preferences.add_local_library</property>
+                                        <property name="margin-top">6</property>
+                                        <property name="margin-bottom">6</property>
+                                        <property name="margin-start">6</property>
+                                        <property name="margin-end">6</property>
+                                        <child>
+                                          <object class="AdwButtonContent">
+                                            <property name="icon-name">list-add-symbolic</property>
+                                            <property name="label" translatable="yes">Add location</property>
+                                          </object>
+                                        </child>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+                        <child>
+                            <object class="AdwExpanderRow">
                                 <property name="title" translatable="yes">Unreal Engine Directories</property>
                                 <child>
                                     <object class="GtkBox" id="unreal_engine_directories_box">

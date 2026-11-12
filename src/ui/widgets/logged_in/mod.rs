@@ -7,6 +7,7 @@ pub mod engines;
 pub mod fab;
 pub mod games;
 pub mod library;
+pub mod local_library;
 mod log_line;
 pub mod logs;
 mod plugins;
@@ -39,6 +40,9 @@ pub mod imp {
         #[template_child]
         pub fab: TemplateChild<crate::ui::widgets::logged_in::fab::FabLibraryBox>,
         #[template_child]
+        pub local_library:
+            TemplateChild<crate::ui::widgets::logged_in::local_library::EpicLocalLibraryBox>,
+        #[template_child]
         pub details:
             TemplateChild<crate::ui::widgets::logged_in::library::asset_detail::EpicAssetDetails>,
         pub settings: gtk4::gio::Settings,
@@ -61,6 +65,7 @@ pub mod imp {
                 projects: TemplateChild::default(),
                 games: TemplateChild::default(),
                 fab: TemplateChild::default(),
+                local_library: TemplateChild::default(),
                 details: TemplateChild::default(),
                 settings: gtk4::gio::Settings::new(crate::config::APP_ID),
             }
@@ -156,6 +161,17 @@ impl EpicLoggedInBox {
         self_.games.set_window(&window.clone());
         self_.fab.set_details(&self_.details);
         self_.fab.set_window(&window.clone());
+        self_.local_library.set_window(&window.clone());
+    }
+
+    /// Select the local library page (and its sidebar button).
+    pub fn open_local_library(&self) {
+        self.imp().sidebar.imp().local_library_category.clicked();
+    }
+
+    /// Re-scan the configured project directories (e.g. after creating a project).
+    pub fn refresh_projects(&self) {
+        self.imp().projects.run_refresh();
     }
 
     pub fn set_download_manager(
@@ -299,5 +315,6 @@ impl Refresh for EpicLoggedInBox {
         self_.projects.run_refresh();
         self_.library.run_refresh();
         self_.fab.run_refresh();
+        self_.local_library.run_refresh();
     }
 }

@@ -1,0 +1,15 @@
+{
+  "jobs": [
+    {
+      "import": "D:/ue_assets_library/import",
+      "library": "D:/ue_assets_library/library"
+    },
+    {
+      "import": "//scott-server/ue_assets_library/import",
+      "library": "//scott-server/ue_assets_library/library"
+    }
+  ],
+  "poll_secs": 30,
+  "stable_secs": 5,
+  "stale_mins": 120
+}

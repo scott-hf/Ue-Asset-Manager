@@ -13,7 +13,6 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use zip::ZipArchive;
@@ -340,7 +339,7 @@ impl EpicFile for crate::ui::widgets::download_manager::EpicDownloadManager {
                     }
                 };
                 item.add_downloaded_size(item.total_size() - item.downloaded_size());
-                if u128::from(metadata.size()) == item.total_size() {
+                if u128::from(metadata.len()) == item.total_size() {
                     let file = match File::open(&p) {
                         Ok(file) => file,
                         Err(e) => {
@@ -412,7 +411,7 @@ fn extract(
                     continue;
                 }
             };
-            if metadata.size() == file.size() {
+            if metadata.len() == file.size() {
                 let _ = sender.send_blocking(Msg::EpicFileExtracted(ver.clone()));
                 continue;
             }
@@ -526,7 +525,7 @@ fn run(
                 return;
             }
         };
-        if metadata.size() == size {
+        if metadata.len() == size {
             debug!("Already downloaded {}", p.to_str().unwrap_or_default());
             let _ = sender.send_blocking(Msg::EpicDownloadProgress(ver.clone(), size));
             let _ = sender.send_blocking(Msg::EpicFileFinished(ver));
@@ -539,7 +538,7 @@ fn run(
             .get(link.clone())
             .header(
                 reqwest::header::RANGE,
-                format!("bytes={}-{}", metadata.size(), size),
+                format!("bytes={}-{}", metadata.len(), size),
             )
             .send()
         {

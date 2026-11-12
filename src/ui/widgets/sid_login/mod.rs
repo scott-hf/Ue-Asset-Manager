@@ -132,6 +132,20 @@ impl SidBox {
             )
         );
 
+        action!(
+            actions,
+            "offline",
+            clone!(
+                #[weak(rename_to=sid_box)]
+                self,
+                move |_, _| {
+                    if let Some(window) = sid_box.imp().window.get() {
+                        window.show_local_library_offline();
+                    }
+                }
+            )
+        );
+
         get_action!(self_.actions, @login).set_enabled(false);
     }
 

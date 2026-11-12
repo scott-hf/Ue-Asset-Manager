@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "epic_asset_manager"
-version = "3.9.2"
+version = "3.9.4"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -1024,6 +1024,7 @@ dependencies = [
  "sha-1",
  "threadpool",
  "tokio",
+ "ue_asset_library",
  "version-compare",
  "winres",
  "zbus",
@@ -4435,6 +4436,17 @@ dependencies = [
  "memoffset",
  "tempfile",
  "winapi",
+]
+
+[[package]]
+name = "ue_asset_library"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zip",
 ]
 
 [[package]]

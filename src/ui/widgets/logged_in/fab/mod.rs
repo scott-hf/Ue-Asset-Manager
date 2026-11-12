@@ -746,7 +746,7 @@ impl FabLibraryBox {
 
             let account_id = eg.user_details().account_id.clone();
             if account_id.is_none() {
-                error!("No account_id available for FAB library fetch");
+                warn!("No account_id available for FAB library fetch (offline / not logged in)");
                 self_.refresh_progress.set_visible(false);
                 return;
             }

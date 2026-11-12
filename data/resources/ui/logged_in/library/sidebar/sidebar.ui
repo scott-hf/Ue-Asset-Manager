@@ -44,6 +44,13 @@
                             </object>
                         </child>
                         <child>
+                            <object class="EpicSidebarButton" id="local_library_category">
+                                <property name="icon-name">drive-harddisk-symbolic</property>
+                                <property name="path">local_library</property>
+                                <property name="tooltip-text" translatable="yes">Local Library</property>
+                            </object>
+                        </child>
+                        <child>
                             <object class="EpicSidebarButton" id="games_category">
                                 <property name="icon-name">input-gaming-symbolic</property>
                                 <property name="filter">games|dlc</property>

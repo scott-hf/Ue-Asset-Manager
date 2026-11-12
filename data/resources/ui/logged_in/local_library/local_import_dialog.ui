@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+    <template class="EpicLocalImportDialog" parent="AdwWindow">
+        <property name="title" translatable="yes">Import from Local Library</property>
+        <property name="default-width">620</property>
+        <property name="default-height">620</property>
+        <property name="modal">true</property>
+        <property name="resizable">true</property>
+        <property name="content">
+            <object class="GtkBox">
+                <property name="orientation">vertical</property>
+                <child>
+                    <object class="AdwHeaderBar">
+                        <property name="show-end-title-buttons">false</property>
+                        <property name="show-start-title-buttons">false</property>
+                        <child type="start">
+                            <object class="GtkButton" id="cancel_button">
+                                <property name="label" translatable="yes">Cancel</property>
+                                <property name="action-name">window.close</property>
+                            </object>
+                        </child>
+                        <child type="end">
+                            <object class="GtkButton" id="import_button">
+                                <property name="label" translatable="yes">Import</property>
+                                <property name="css-classes">suggested-action</property>
+                                <property name="sensitive">false</property>
+                            </object>
+                        </child>
+                    </object>
+                </child>
+                <child>
+                    <object class="GtkBox">
+                        <property name="orientation">vertical</property>
+                        <property name="vexpand">true</property>
+                        <property name="margin-start">16</property>
+                        <property name="margin-end">16</property>
+                        <property name="margin-top">12</property>
+                        <property name="margin-bottom">16</property>
+                        <property name="spacing">12</property>
+                        <child>
+                            <object class="GtkLabel" id="title_label">
+                                <property name="css-classes">title-3</property>
+                                <property name="halign">start</property>
+                                <property name="wrap">true</property>
+                                <property name="xalign">0</property>
+                                <property name="label" translatable="yes">Select a project</property>
+                            </object>
+                        </child>
+
+                        <!-- Existing project picker (Content / Plugin kinds) -->
+                        <child>
+                            <object class="GtkBox" id="project_section">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">8</property>
+                                <property name="vexpand">true</property>
+                                <child>
+                                    <object class="AdwBanner" id="no_projects_bar">
+                                        <property name="title" translatable="yes">No projects found. Add a projects directory in the preferences.</property>
+                                        <property name="revealed">false</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkScrolledWindow">
+                                        <property name="vexpand">true</property>
+                                        <property name="min-content-height">160</property>
+                                        <property name="hscrollbar-policy">never</property>
+                                        <property name="css-classes">card</property>
+                                        <property name="child">
+                                            <object class="GtkListView" id="projects_list">
+                                                <property name="css-classes">rich-list</property>
+                                            </object>
+                                        </property>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+
+                        <!-- New project (Project kind) -->
+                        <child>
+                            <object class="GtkBox" id="new_project_section">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">8</property>
+                                <property name="visible">false</property>
+                                <child>
+                                    <object class="GtkLabel">
+                                        <property name="label" translatable="yes">Project folder name</property>
+                                        <property name="halign">start</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkEntry" id="project_name_entry"/>
+                                </child>
+                                <child>
+                                    <object class="GtkLabel">
+                                        <property name="label" translatable="yes">Create in directory</property>
+                                        <property name="halign">start</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkBox">
+                                        <property name="spacing">8</property>
+                                        <child>
+                                            <object class="GtkLabel" id="parent_dir_label">
+                                                <property name="hexpand">true</property>
+                                                <property name="halign">start</property>
+                                                <property name="xalign">0</property>
+                                                <property name="ellipsize">start</property>
+                                                <property name="label" translatable="yes">No directory selected</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkButton" id="choose_parent_button">
+                                                <property name="label" translatable="yes">Choose...</property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+
+                        <!-- Overwrite policy -->
+                        <child>
+                            <object class="GtkBox" id="overwrite_section">
+                                <property name="spacing">12</property>
+                                <child>
+                                    <object class="GtkLabel">
+                                        <property name="label" translatable="yes">Overwrite existing files (originals are backed up to Saved/EAM_Backups)</property>
+                                        <property name="hexpand">true</property>
+                                        <property name="halign">start</property>
+                                        <property name="wrap">true</property>
+                                        <property name="xalign">0</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkSwitch" id="overwrite_switch">
+                                        <property name="valign">center</property>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+
+                        <!-- Conflict preview / status -->
+                        <child>
+                            <object class="GtkScrolledWindow" id="status_scroll">
+                                <property name="min-content-height">110</property>
+                                <property name="max-content-height">180</property>
+                                <property name="propagate-natural-height">true</property>
+                                <property name="child">
+                                    <object class="GtkLabel" id="status_label">
+                                        <property name="selectable">true</property>
+                                        <property name="halign">start</property>
+                                        <property name="valign">start</property>
+                                        <property name="xalign">0</property>
+                                        <property name="wrap">true</property>
+                                        <property name="wrap-mode">word-char</property>
+                                        <property name="css-classes">caption</property>
+                                    </object>
+                                </property>
+                            </object>
+                        </child>
+                        <child>
+                            <object class="GtkSpinner" id="spinner"/>
+                        </child>
+                    </object>
+                </child>
+            </object>
+        </property>
+    </template>
+</interface>

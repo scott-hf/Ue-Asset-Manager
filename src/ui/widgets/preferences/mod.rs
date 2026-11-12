@@ -43,6 +43,8 @@ pub mod imp {
         #[template_child]
         pub unreal_engine_vault_directories_box: TemplateChild<gtk4::Box>,
         #[template_child]
+        pub local_library_directories_box: TemplateChild<gtk4::Box>,
+        #[template_child]
         pub unreal_engine_directories_box: TemplateChild<gtk4::Box>,
         #[template_child]
         pub github_token: TemplateChild<gtk4::PasswordEntry>,
@@ -80,6 +82,7 @@ pub mod imp {
                 dark_theme_group: TemplateChild::default(),
                 unreal_engine_project_directories_box: TemplateChild::default(),
                 unreal_engine_vault_directories_box: TemplateChild::default(),
+                local_library_directories_box: TemplateChild::default(),
                 unreal_engine_directories_box: TemplateChild::default(),
                 github_token: TemplateChild::default(),
                 github_user: TemplateChild::default(),
@@ -126,6 +129,7 @@ pub enum DirectoryConfigType {
     Cache,
     Temp,
     Vault,
+    LocalLibrary,
     Engine,
     Projects,
     Games,
@@ -145,11 +149,12 @@ impl PreferencesWindow {
         ("3", "Debug"),
         ("4", "Trace"),
     ];
-    const DEFAULT_CATEGORY_OPTIONS: [(&'static str, &'static str); 5] = [
+    const DEFAULT_CATEGORY_OPTIONS: [(&'static str, &'static str); 6] = [
         ("engines", "Engines"),
         ("projects", "Projects"),
         ("library", "Library"),
         ("fab", "Fab"),
+        ("local_library", "Local Library"),
         ("games", "Games"),
     ];
     const ACCENT_COLOR_OPTIONS: [(&'static str, &'static str); 7] = [
@@ -427,6 +432,14 @@ impl PreferencesWindow {
             );
         }
 
+        for dir in self_.settings.strv("local-library-directories") {
+            self.add_directory_row(
+                &self_.local_library_directories_box,
+                dir.to_string(),
+                DirectoryConfigType::LocalLibrary,
+            );
+        }
+
         for dir in self_.settings.strv("unreal-engine-directories") {
             self.add_directory_row(
                 &self_.unreal_engine_directories_box,
@@ -639,6 +652,20 @@ impl PreferencesWindow {
         );
         action!(
             actions,
+            "add_local_library",
+            clone!(
+                #[weak(rename_to=preferences)]
+                self,
+                move |_, _| {
+                    preferences.select_directory(
+                        "Local Library Directory",
+                        DirectoryConfigType::LocalLibrary,
+                    );
+                }
+            )
+        );
+        action!(
+            actions,
             "add_engine",
             clone!(
                 #[weak(rename_to=preferences)]
@@ -700,6 +727,7 @@ impl PreferencesWindow {
                     .unwrap();
             }
             DirectoryConfigType::Vault
+            | DirectoryConfigType::LocalLibrary
             | DirectoryConfigType::Engine
             | DirectoryConfigType::Projects => {
                 if let Some((setting_name, widget)) = self.setting_name_and_box_from_type(kind) {
@@ -736,6 +764,7 @@ impl PreferencesWindow {
                 None
             }
             DirectoryConfigType::Vault => Some("unreal-vault-directories"),
+            DirectoryConfigType::LocalLibrary => Some("local-library-directories"),
             DirectoryConfigType::Engine => Some("unreal-engine-directories"),
             DirectoryConfigType::Projects => Some("unreal-projects-directories"),
         }
@@ -753,6 +782,10 @@ impl PreferencesWindow {
             DirectoryConfigType::Vault => Some((
                 "unreal-vault-directories",
                 &*self_.unreal_engine_vault_directories_box,
+            )),
+            DirectoryConfigType::LocalLibrary => Some((
+                "local-library-directories",
+                &*self_.local_library_directories_box,
             )),
             DirectoryConfigType::Engine => Some((
                 "unreal-engine-directories",

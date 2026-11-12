@@ -339,6 +339,20 @@ impl EpicAssetManagerWindow {
         self_.main_stack.set_visible_child_name("logged_in_stack");
     }
 
+    /// Show only the local library, without any Epic account data.
+    pub fn show_local_library_offline(&self) {
+        let self_ = self.imp();
+        self_.logged_in_stack.set_window(self);
+        self_.download_manager.set_window(self);
+        self_
+            .logged_in_stack
+            .set_download_manager(&self_.download_manager);
+        self.show_logged_in();
+        // The Epic refresh needs a session; the local library has its own refresh button.
+        self_.refresh.set_visible(false);
+        self_.logged_in_stack.open_local_library();
+    }
+
     pub fn do_logout(&self) {
         let self_ = self.imp();
         self.save_secret(

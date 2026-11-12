@@ -32,6 +32,8 @@ pub mod imp {
         #[template_child]
         pub fab_category: TemplateChild<button::EpicSidebarButton>,
         #[template_child]
+        pub local_library_category: TemplateChild<button::EpicSidebarButton>,
+        #[template_child]
         pub games_category: TemplateChild<button::EpicSidebarButton>,
     }
 
@@ -51,6 +53,7 @@ pub mod imp {
                 projects_category: TemplateChild::default(),
                 library_category: TemplateChild::default(),
                 fab_category: TemplateChild::default(),
+                local_library_category: TemplateChild::default(),
                 games_category: TemplateChild::default(),
                 settings: gio::Settings::new(crate::config::APP_ID),
             }
@@ -74,6 +77,7 @@ pub mod imp {
             self.projects_category.set_sidebar(&obj);
             self.library_category.set_sidebar(&obj);
             self.fab_category.set_sidebar(&obj);
+            self.local_library_category.set_sidebar(&obj);
             self.games_category.set_sidebar(&obj);
         }
     }
@@ -118,6 +122,7 @@ impl EpicSidebar {
             "engines" => &self_.engines_category,
             "projects" => &self_.projects_category,
             "fab" => &self_.fab_category,
+            "local_library" => &self_.local_library_category,
             "games" => &self_.games_category,
             _ => &self_.library_category,
         }
@@ -212,6 +217,7 @@ impl EpicSidebar {
         self_.projects_category.activate(true);
         self_.library_category.activate(true);
         self_.fab_category.activate(true);
+        self_.local_library_category.activate(true);
         self_.games_category.activate(true);
     }
 }

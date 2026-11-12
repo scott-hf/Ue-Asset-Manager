@@ -254,6 +254,7 @@ impl DockerEngineDownload {
                             || (!label.contains("slim") && check.is_active())
                         {
                             self.set_property("selected", label);
+                            #[cfg(target_os = "linux")]
                             self.docker_manifest();
                             return;
                         }
@@ -436,6 +437,7 @@ impl DockerEngineDownload {
                             check.set_sensitive(true);
                         } else {
                             self.set_property("selected", label);
+                            #[cfg(target_os = "linux")]
                             self.docker_manifest();
                         }
                     }

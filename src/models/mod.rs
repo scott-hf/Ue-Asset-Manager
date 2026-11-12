@@ -3,7 +3,9 @@ pub mod category_data;
 pub mod database;
 pub mod engine_data;
 pub mod fab_data;
+pub mod fab_overlay;
 pub mod fab_search_data;
+pub mod local_library;
 pub mod log_data;
 mod plugin_data;
 pub mod project_data;
@@ -301,6 +303,7 @@ impl Model {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn load_egs_secrets(
         &self,
         item: &secret_service::blocking::Item,

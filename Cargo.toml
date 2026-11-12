@@ -9,7 +9,11 @@ description = "An unofficial client to install Unreal Engine, download and manag
 keywords = ["unreal", "engine", "gamedev", "assets", "epic"]
 categories = ["gui"]
 
+[workspace]
+members = [".", "crates/ue_asset_library"]
+
 [dependencies]
+ue_asset_library = { path = "crates/ue_asset_library" }
 adw = { package = "libadwaita", version = "0.8", features = ["v1_5"] }
 anyhow = "1.0"
 async-channel = "2"
