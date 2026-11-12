@@ -194,7 +194,23 @@ cached data, merges only added/changed assets; removals only on explicit full re
 "since" parameter, so the listing is still fetched each start; only processing is delta.
 
 ### 4.4 Archive intake (.rar/.7z/multi-volume)
-Sanitizer extracts these with the same hardening, repacks into a normal library zip. See the crate README.
+Accepted: `.rar`, `.7z`, `.7z.001`/`.zip.001` splits, `.partN.rar` and `.rar`+`.r00` sets (deps: `sevenz-rust2`,
+`unrar` with a `raw-dylib` advapi32 link fix on windows-gnu). A volume set is processed only when every volume is
+present and stable; all volumes move together between folders. Identity = sha256 over all volumes. Extraction uses
+the zip hardening rules, then repacks into a normal library zip. RAR entries are extracted to short sequential temp
+names (`f000001`...) because unrar can't create long/non-ASCII paths; the real name is applied in the zip. Entry path
+cap is 400 chars (Windows long paths are enabled on both machines). Names like `(5.0 â€“ 5.8)` / `[5.0-5.3]` are
+stripped; `engine_version_guess` = lowest, full range in sidecar `extra` (`engine_version_min/max`).
+Encrypted -> needs-review `ENCRYPTED`; corrupt -> `ARCHIVE_CORRUPT`; incomplete RAR set -> retried.
+
+### 4.5 Layout planner additions
+* `__ExternalActors__` / `__ExternalObjects__` (OFPA) are excluded from root voting and kept under `Content/`.
+* A rule held by >= 95% of resolved assets tolerates outliers (instead of `RULE_DISAGREE`).
+* Own-path matching tolerates renamed assets (`<stem>` minus trailing `_<digits>`) when the directory rule agrees.
+* Nested archives (outer archive with no assets, only inner archives): choose via sanitizer.json
+  `prefer_engine_versions` (default `["5.8"]`), else highest version; different base names -> `NESTED_AMBIGUOUS`;
+  depth <= 2. Sidecar records `nested_chosen`/`nested_skipped`.
+* Server deploy: `_deploy/install.ps1` copies `*.exe` and `*.dll` (the exe needs `libwinpthread-1.dll`).
 
 ## 5. Verified vs not verified
 
@@ -203,7 +219,11 @@ sample zips and on the real share (Camping, Operating Room, Advanced Crafting pl
 handled), release build, standalone install run, Local Library scan and import programmatically,
 Fab search/match/clear with a real session, download dialog opened on real Epic and Fab assets.
 
-Not verified: mouse/visual pass over the new UI, the project picker and "Create new project" flows,
+Also verified on the real share: .7z.001/.002 megapack, .rar plugin/content, Fuel System rar, Fabric rar, nested
+Enhanced Timer Manager (5.8 chosen), PN Cleaver.
+
+Not verified: multi-volume and encrypted RAR (unit tests only), Fab delta cache against the live API, version-label
+click-through in the dialog, mouse/visual pass over the new UI, the project picker and "Create new project" flows,
 `--watch` over days / task restart-on-failure, the Linux/Flatpak build after the workspace change,
 offline hiding of the Match button, detail-pane legacy "Add to Project" panel (still the old one).
 
