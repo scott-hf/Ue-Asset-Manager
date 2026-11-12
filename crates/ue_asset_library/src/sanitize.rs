@@ -1,6 +1,7 @@
 //! Sanitize one dropped zip into the library (zip first, sidecar last as the commit marker).
 
 use crate::error::{NeedsReview, SanitizeError};
+use crate::harden::scan_entries;
 use crate::layout::{plan_layout, Layout};
 use crate::name::clean_name_ranged;
 use crate::sidecar::{Kind, Sidecar, SCHEMA_VERSION};
@@ -10,6 +11,37 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use zip::result::ZipError;
 use zip::{ZipArchive, ZipWriter};
+
+/// Per-run options of the sanitizer.
+#[derive(Clone, Debug)]
+pub struct SanitizeOptions {
+    /// Engine versions to prefer when an archive wraps one inner archive per version
+    /// (order = priority). When none matches, the highest version found is used.
+    pub prefer_engine_versions: Vec<String>,
+    pub(crate) depth: u8,
+}
+
+impl Default for SanitizeOptions {
+    fn default() -> Self {
+        SanitizeOptions::new(vec!["5.8".to_string()])
+    }
+}
+
+impl SanitizeOptions {
+    pub fn new(prefer_engine_versions: Vec<String>) -> Self {
+        SanitizeOptions {
+            prefer_engine_versions,
+            depth: 0,
+        }
+    }
+
+    pub(crate) fn deeper(&self) -> Self {
+        SanitizeOptions {
+            prefer_engine_versions: self.prefer_engine_versions.clone(),
+            depth: self.depth + 1,
+        }
+    }
+}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -51,6 +83,7 @@ pub(crate) fn find_duplicate_pub(library_dir: &Path, sha12: &str) -> Option<Path
 
 /// Identity of an original (non-zip or multi-volume) archive whose converted temp zip is
 /// being sanitized: the library records these instead of the temp zip's own.
+#[derive(Clone)]
 pub(crate) struct SourceOverride {
     /// First volume file name (`source_zip` in the sidecar).
     pub name: String,
@@ -58,6 +91,10 @@ pub(crate) struct SourceOverride {
     pub sha256: String,
     pub volumes: Vec<String>,
     pub format: &'static str,
+    /// Extra sidecar fields (nested archive choice).
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Engine version of a chosen nested archive.
+    pub engine_version: Option<String>,
 }
 
 fn find_duplicate(library_dir: &Path, sha12: &str) -> Option<PathBuf> {
@@ -115,13 +152,23 @@ fn write_zip(src: &Path, layout: &Layout, tmp: &Path) -> Result<(), SanitizeErro
 /// Temp files are created inside `library_dir` (same filesystem), the zip is renamed
 /// into place first and the sidecar is renamed in LAST. The original is not moved.
 pub fn sanitize_zip(src: &Path, library_dir: &Path) -> Result<SanitizeOutcome, SanitizeError> {
-    sanitize_zip_with(src, library_dir, None)
+    sanitize_zip_with(src, library_dir, None, &SanitizeOptions::default())
+}
+
+/// [`sanitize_zip`] with explicit options (nested-archive version preference).
+pub fn sanitize_zip_with_options(
+    src: &Path,
+    library_dir: &Path,
+    opts: &SanitizeOptions,
+) -> Result<SanitizeOutcome, SanitizeError> {
+    sanitize_zip_with(src, library_dir, None, opts)
 }
 
 pub(crate) fn sanitize_zip_with(
     src: &Path,
     library_dir: &Path,
     ov: Option<&SourceOverride>,
+    opts: &SanitizeOptions,
 ) -> Result<SanitizeOutcome, SanitizeError> {
     fs::create_dir_all(library_dir)?;
     let file_name = match ov {
@@ -143,6 +190,21 @@ pub(crate) fn sanitize_zip_with(
     let sha12 = &sha[..12];
     if let Some(existing) = find_duplicate(library_dir, sha12) {
         return Ok(SanitizeOutcome::Duplicate { existing });
+    }
+    // A wrapper around per-version archives (no assets of its own) is unpacked one level.
+    let entries = scan_entries(&mut archive).map_err(SanitizeError::NeedsReview)?;
+    if let Some(cands) = crate::nested::detect(&entries) {
+        let base = SourceOverride {
+            name: file_name.clone(),
+            sha256: sha.clone(),
+            volumes: ov
+                .map(|o| o.volumes.clone())
+                .unwrap_or_else(|| vec![file_name.clone()]),
+            format: ov.map(|o| o.format).unwrap_or("zip"),
+            extra: ov.map(|o| o.extra.clone()).unwrap_or_default(),
+            engine_version: None,
+        };
+        return crate::nested::run(&mut archive, &cands, library_dir, &base, opts);
     }
     let layout = plan_layout(&mut archive).map_err(SanitizeError::NeedsReview)?;
     drop(archive);
@@ -170,6 +232,9 @@ pub(crate) fn sanitize_zip_with(
     }
     if let Some(o) = ov {
         extra.insert("source_format".into(), o.format.into());
+        for (k, v) in &o.extra {
+            extra.insert(k.clone(), v.clone());
+        }
         if o.volumes.len() > 1 {
             extra.insert("source_volumes".into(), serde_json::json!(o.volumes));
         }
@@ -180,7 +245,11 @@ pub(crate) fn sanitize_zip_with(
         display_name,
         source_zip: file_name,
         sha256: sha,
-        engine_version_guess: layout.engine_version.clone().or(name_version),
+        engine_version_guess: layout
+            .engine_version
+            .clone()
+            .or_else(|| ov.and_then(|o| o.engine_version.clone()))
+            .or(name_version),
         content_folder: layout.content_folder.clone(),
         plugin_name: layout.plugin_name.clone(),
         zip_prefix: layout.zip_prefix.clone(),

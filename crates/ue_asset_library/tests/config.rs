@@ -223,3 +223,22 @@ fn watch_tick_recovers_when_a_job_becomes_available() {
     assert_eq!(rep.sanitized.len(), 1, "{lines:?}");
     assert!(lines.iter().any(|l| l.contains("available again")));
 }
+
+#[test]
+fn prefer_engine_versions_config() {
+    let d = SanitizerConfig::from_json(r#"{"jobs":[{"import":"a","library":"b"}]}"#).unwrap();
+    assert_eq!(d.prefer_engine_versions, vec!["5.8".to_string()]);
+    let c = SanitizerConfig::from_json(
+        r#"{"jobs":[{"import":"a","library":"b"}],"prefer_engine_versions":["5.7","5.8"]}"#,
+    )
+    .unwrap();
+    assert_eq!(c.prefer_engine_versions, vec!["5.7", "5.8"]);
+    assert_eq!(
+        c.pipeline_configs(false)[0].prefer_engine_versions,
+        vec!["5.7", "5.8"]
+    );
+    assert!(SanitizerConfig::from_json(
+        r#"{"jobs":[{"import":"a","library":"b"}],"prefer_engine_versions":["banana"]}"#
+    )
+    .is_err());
+}

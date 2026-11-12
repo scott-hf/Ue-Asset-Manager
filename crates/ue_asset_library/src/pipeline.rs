@@ -6,10 +6,10 @@
 //! never scanned as inboxes).
 
 use crate::archive::{
-    group_volumes, kind_of_name, sanitize_archive, sevenz_expected_len, ArchiveKind,
+    group_volumes, kind_of_name, sanitize_archive_with, sevenz_expected_len, ArchiveKind,
 };
 use crate::error::{NeedsReview, SanitizeError};
-use crate::sanitize::{sanitize_zip, SanitizeOutcome};
+use crate::sanitize::{sanitize_zip_with_options, SanitizeOptions, SanitizeOutcome};
 use crate::util::{hostname, is_busy_error, move_unique, rfc3339_utc, unix_secs};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -33,6 +33,8 @@ pub struct Config {
     pub claim_grace_secs: u64,
     /// Attempts for truncated / busy zips before they move to `failed/`.
     pub max_retries: u32,
+    /// Engine versions preferred when an archive wraps one inner archive per version.
+    pub prefer_engine_versions: Vec<String>,
 }
 
 impl Config {
@@ -46,6 +48,7 @@ impl Config {
             tmp_age_secs: 900,
             claim_grace_secs: 300,
             max_retries: 3,
+            prefer_engine_versions: vec!["5.8".to_string()],
         }
     }
 }
@@ -403,14 +406,18 @@ pub fn run_pass(cfg: &Config, state: &mut State, log: &mut dyn FnMut(&str)) -> P
     rep
 }
 
-fn run_sanitize(claim: &Claim, library: &Path) -> Result<SanitizeOutcome, SanitizeError> {
+fn run_sanitize(
+    claim: &Claim,
+    library: &Path,
+    opts: &SanitizeOptions,
+) -> Result<SanitizeOutcome, SanitizeError> {
     match kind_of_name(&claim.name) {
         Some(k) if k != ArchiveKind::Zip => {
             let mut vols = vec![claim.zip_path.clone()];
             vols.extend(claim.extra_volumes.iter().cloned());
-            sanitize_archive(k, &vols, library)
+            sanitize_archive_with(k, &vols, library, opts)
         }
-        _ => sanitize_zip(&claim.zip_path, library),
+        _ => sanitize_zip_with_options(&claim.zip_path, library, opts),
     }
 }
 
@@ -442,7 +449,8 @@ fn process_claim(
     log: &mut dyn FnMut(&str),
 ) {
     let name = claim.name.clone();
-    match run_sanitize(&claim, &cfg.library_dir) {
+    let opts = SanitizeOptions::new(cfg.prefer_engine_versions.clone());
+    match run_sanitize(&claim, &cfg.library_dir, &opts) {
         Ok(SanitizeOutcome::Sanitized {
             library_zip,
             sidecar,

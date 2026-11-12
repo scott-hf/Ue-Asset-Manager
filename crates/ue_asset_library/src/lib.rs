@@ -14,12 +14,13 @@ pub mod import;
 pub mod layout;
 pub mod library;
 pub mod name;
+pub mod nested;
 pub mod pipeline;
 pub mod sanitize;
 pub mod sidecar;
 mod util;
 
-pub use archive::{group_volumes, sanitize_archive, ArchiveKind, VolumeSet};
+pub use archive::{group_volumes, sanitize_archive, sanitize_archive_with, ArchiveKind, VolumeSet};
 pub use error::{ImportError, NeedsReview, SanitizeError};
 pub use import::{
     preview_import, safe_import, safe_import_new_project, ImportPolicy, ImportReport,
@@ -27,5 +28,5 @@ pub use import::{
 pub use layout::{plan_layout, EntryRename, Layout};
 pub use library::{scan_library, LibraryEntry};
 pub use name::{clean_name, clean_name_ranged};
-pub use sanitize::{sanitize_zip, SanitizeOutcome};
+pub use sanitize::{sanitize_zip, sanitize_zip_with_options, SanitizeOptions, SanitizeOutcome};
 pub use sidecar::{Kind, Sidecar};

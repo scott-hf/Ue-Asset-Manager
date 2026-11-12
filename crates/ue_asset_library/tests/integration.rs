@@ -1144,3 +1144,112 @@ fn single_outlier_asset_is_tolerated() {
     assert_eq!(sc.content_folder.as_deref(), Some("P"));
     assert_eq!(sc.entry_count, 31);
 }
+
+// ---------- nested archives and tolerant own-path matching ----------
+
+fn nested_outer(dir: &Path) -> PathBuf {
+    let inner = |v: &str| {
+        let p = dir.join(format!("Pack {v}.zip"));
+        op_room_zip(&p);
+        fs::read(&p).unwrap()
+    };
+    let (a, b) = (inner("5.7"), inner("5.8"));
+    let outer = dir.join("Pack 5.7-5.8.zip");
+    make_zip(&outer, &[("Pack 5.7.zip", a), ("Pack 5.8.zip", b)]);
+    outer
+}
+
+#[test]
+fn nested_archive_picks_preferred_version() {
+    use ue_asset_library::{sanitize_zip_with_options, SanitizeOptions};
+    let t = Tmp::new();
+    let outer = nested_outer(&t.dir("src"));
+    let lib = t.dir("lib");
+    let sc =
+        match sanitize_zip_with_options(&outer, &lib, &SanitizeOptions::new(vec!["5.7".into()]))
+            .unwrap()
+        {
+            SanitizeOutcome::Sanitized { sidecar, .. } => sidecar,
+            o => panic!("{o:?}"),
+        };
+    assert_eq!(sc.engine_version_guess.as_deref(), Some("5.7"));
+    assert_eq!(sc.source_zip, "Pack 5.7-5.8.zip");
+    assert_eq!(sc.display_name, "Pack");
+    assert_eq!(sc.extra["nested_chosen"], "Pack 5.7.zip");
+    assert_eq!(sc.extra["nested_skipped"][0], "Pack 5.8.zip");
+    assert_eq!(
+        sc.sha256,
+        ue_asset_library::archive::sha256_files(std::slice::from_ref(&outer)).unwrap()
+    );
+    assert!(matches!(
+        sanitize_zip_with_options(&outer, &lib, &SanitizeOptions::default()).unwrap(),
+        SanitizeOutcome::Duplicate { .. }
+    ));
+    let lib2 = t.dir("lib2");
+    match sanitize_zip_with_options(&outer, &lib2, &SanitizeOptions::new(vec!["5.3".into()]))
+        .unwrap()
+    {
+        SanitizeOutcome::Sanitized { sidecar, .. } => {
+            assert_eq!(sidecar.engine_version_guess.as_deref(), Some("5.8"))
+        }
+        o => panic!("{o:?}"),
+    }
+    assert!(fs::read_dir(&lib)
+        .unwrap()
+        .flatten()
+        .all(|e| !e.file_name().to_string_lossy().starts_with(".tmp-")));
+}
+
+#[test]
+fn nested_different_packs_are_ambiguous() {
+    let t = Tmp::new();
+    let d = t.dir("src");
+    let (a, b) = (d.join("a.zip"), d.join("b.zip"));
+    op_room_zip(&a);
+    op_room_zip(&b);
+    let outer = d.join("both.zip");
+    make_zip(
+        &outer,
+        &[
+            ("Alpha Pack 5.7.zip", fs::read(&a).unwrap()),
+            ("Beta Thing 5.8.zip", fs::read(&b).unwrap()),
+        ],
+    );
+    match sanitize_zip(&outer, &t.dir("lib")) {
+        Err(SanitizeError::NeedsReview(n)) => assert_eq!(n.code(), "NESTED_AMBIGUOUS"),
+        o => panic!("{o:?}"),
+    }
+}
+
+fn anim_zip(path: &Path, renamed_own: &str, exact: usize, renamed: usize) {
+    let mut e: Vec<(String, Vec<u8>)> = (0..exact)
+        .map(|i| {
+            (
+                format!("P/Anim/A_{i}.uasset"),
+                fake_asset(&format!("/Game/P/Anim/A_{i}"), &[]),
+            )
+        })
+        .collect();
+    for i in 0..renamed {
+        e.push((format!("P/Anim/B_{i}.uasset"), fake_asset(renamed_own, &[])));
+    }
+    let r: Vec<(&str, Vec<u8>)> = e.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    make_zip(path, &r);
+}
+
+#[test]
+fn renamed_after_cooking_assets_match_tolerantly() {
+    let t = Tmp::new();
+    let src = t.path().join("Anims 4.27.zip");
+    anim_zip(&src, "/Game/P/Anim/B", 20, 10);
+    let (_z, sc) = sanitized(&src, &t.dir("lib"));
+    assert_eq!(sc.content_folder.as_deref(), Some("P"));
+    assert_eq!(sc.entry_count, 30);
+    // The same names under a different directory must not count as resolved.
+    let bad = t.path().join("Bad 4.27.zip");
+    anim_zip(&bad, "/Game/Other/B", 20, 10);
+    match sanitize_zip(&bad, &t.dir("lib2")) {
+        Err(SanitizeError::NeedsReview(NeedsReview::TooManyUnresolved { .. })) => {}
+        o => panic!("{o:?}"),
+    }
+}

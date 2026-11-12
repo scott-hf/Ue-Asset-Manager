@@ -39,6 +39,11 @@ through a chained reader) and `unrar` (bundled UnRAR C++ source, so no external 
 RAR content is extracted to `library/.tmp-<id>/` under names the sanitizer chose, then zipped.
 On windows-gnu the crate links `advapi32` itself (raw-dylib), which `unrar_sys` forgets.
 
+Own-path matching is tolerant of files renamed after cooking: an asset whose package name
+equals its file stem minus a trailing `_<digits>` (e.g. `Anim_X_10.uasset` holding
+`.../Anim_X`) is counted as resolved, but only when it maps to a rule the exact matches
+already voted for (never a new root).
+
 Names: version ranges such as `Pack (5.0 – 5.8)`, `Pack[5.0-5.3]` are stripped from the display
 name; `engine_version_guess` is the lowest endpoint and `extra.engine_version_min` /
 `engine_version_max` hold the range. Archive suffixes (`.7z`, `.rar`, `.001`, `.part1.rar`) are
@@ -70,13 +75,21 @@ back to the import root.
   ],
   "poll_secs": 30,
   "stable_secs": 5,
-  "stale_mins": 120
+  "stale_mins": 120,
+  "prefer_engine_versions": ["5.8"]
 }
 ```
 
 * `jobs`: any number; each is processed independently. An unreachable share, a missing
   import folder or an unwritable library fails only that job (it is logged once and
   retried every poll in `--watch`).
+* `prefer_engine_versions` (default `["5.8"]`, order = priority): when an archive holds no
+  assets of its own but one inner archive per engine version (e.g. `Pack 5.7.zip` +
+  `Pack 5.8.zip`), the first listed version found is used; if none matches, the highest version
+  present. The sidecar records `extra.nested_chosen` / `extra.nested_skipped`;
+  `engine_version_guess` is the chosen inner version and the hash/`source_zip` stay the outer
+  archive's. Inner archives with different base names -> `needs-review` code `NESTED_AMBIGUOUS`;
+  more than 2 nesting levels -> `NESTED_TOO_DEEP`. Entries must be single-file zip/7z/rar.
 * `poll_secs`, `stable_secs`, `stale_mins` are optional (defaults shown). Unknown keys are
   rejected so typos do not pass silently.
 * Relative paths are resolved against the config file's folder. Use forward slashes or

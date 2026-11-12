@@ -82,6 +82,7 @@ fn build_config(a: &Args) -> Result<SanitizerConfig, String> {
             poll_secs: 30,
             stable_secs: 5,
             stale_mins: 120,
+            prefer_engine_versions: ue_asset_library::config::default_prefer_engine_versions(),
         }
     } else {
         let path = a

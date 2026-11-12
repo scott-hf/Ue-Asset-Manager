@@ -14,7 +14,7 @@
 
 use crate::error::{NeedsReview, SanitizeError};
 use crate::harden::{check_paths, normalize_name, EntryInfo, MAX_ENTRIES, MAX_UNCOMPRESSED};
-use crate::sanitize::{sanitize_zip_with, SanitizeOutcome, SourceOverride};
+use crate::sanitize::{sanitize_zip_with, SanitizeOptions, SanitizeOutcome, SourceOverride};
 use crate::util::unique_token;
 use regex::Regex;
 use sevenz_rust2::{ArchiveReader, Password};
@@ -549,9 +549,19 @@ pub fn sanitize_archive(
     volumes: &[PathBuf],
     library_dir: &Path,
 ) -> Result<SanitizeOutcome, SanitizeError> {
-    let first = volumes
-        .first()
-        .ok_or_else(|| SanitizeError::Io("archive set without volumes".into()))?;
+    sanitize_archive_with(kind, volumes, library_dir, &SanitizeOptions::default())
+}
+
+/// [`sanitize_archive`] with explicit options (nested-archive version preference).
+pub fn sanitize_archive_with(
+    kind: ArchiveKind,
+    volumes: &[PathBuf],
+    library_dir: &Path,
+    opts: &SanitizeOptions,
+) -> Result<SanitizeOutcome, SanitizeError> {
+    if volumes.is_empty() {
+        return Err(SanitizeError::Io("archive set without volumes".into()));
+    }
     fs::create_dir_all(library_dir)?;
     let names: Vec<String> = volumes
         .iter()
@@ -567,9 +577,23 @@ pub fn sanitize_archive(
         sha256: sha,
         volumes: names,
         format: kind.label(),
+        extra: serde_json::Map::new(),
+        engine_version: None,
     };
+    convert_and_sanitize(kind, volumes, library_dir, &sov, opts)
+}
+
+/// Convert `volumes` to a temp zip (unless already a zip) and sanitize it under `sov`.
+pub(crate) fn convert_and_sanitize(
+    kind: ArchiveKind,
+    volumes: &[PathBuf],
+    library_dir: &Path,
+    sov: &SourceOverride,
+    opts: &SanitizeOptions,
+) -> Result<SanitizeOutcome, SanitizeError> {
+    let first = &volumes[0];
     if kind == ArchiveKind::Zip {
-        return sanitize_zip_with(first, library_dir, Some(&sov));
+        return sanitize_zip_with(first, library_dir, Some(sov), opts);
     }
     // Duplicate check before any extraction work.
     if let Some(existing) = crate::sanitize::find_duplicate_pub(library_dir, &sov.sha256[..12]) {
@@ -582,7 +606,7 @@ pub fn sanitize_archive(
         ArchiveKind::SplitZip => concat_to(volumes, &tmp_zip),
         ArchiveKind::Zip => unreachable!(),
     };
-    let result = converted.and_then(|()| sanitize_zip_with(&tmp_zip, library_dir, Some(&sov)));
+    let result = converted.and_then(|()| sanitize_zip_with(&tmp_zip, library_dir, Some(sov), opts));
     let _ = fs::remove_file(&tmp_zip);
     result
 }

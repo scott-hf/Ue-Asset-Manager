@@ -13,6 +13,11 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_NAME: &str = "sanitizer.json";
 
+/// Default `prefer_engine_versions`.
+pub fn default_prefer_engine_versions() -> Vec<String> {
+    vec!["5.8".to_string()]
+}
+
 fn default_poll() -> u64 {
     30
 }
@@ -43,6 +48,10 @@ pub struct SanitizerConfig {
     pub stable_secs: u64,
     #[serde(default = "default_stale")]
     pub stale_mins: u64,
+    /// Engine versions to prefer when an archive wraps one inner archive per version
+    /// (order = priority; when none matches, the highest version found is used).
+    #[serde(default = "default_prefer_engine_versions")]
+    pub prefer_engine_versions: Vec<String>,
 }
 
 impl SanitizerConfig {
@@ -90,6 +99,13 @@ impl SanitizerConfig {
                 ));
             }
         }
+        for v in &self.prefer_engine_versions {
+            if crate::name::parse_engine_version(v).is_none() {
+                return Err(format!(
+                    "invalid config: \"prefer_engine_versions\" entry {v:?} is not an engine version like \"5.8\""
+                ));
+            }
+        }
         if self.poll_secs == 0 {
             return Err("invalid config: \"poll_secs\" must be at least 1".into());
         }
@@ -105,6 +121,7 @@ impl SanitizerConfig {
                 c.stable_secs = self.stable_secs;
                 c.stale_mins = self.stale_mins;
                 c.requeue = requeue;
+                c.prefer_engine_versions = self.prefer_engine_versions.clone();
                 c
             })
             .collect()

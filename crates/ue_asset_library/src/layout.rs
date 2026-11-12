@@ -85,6 +85,13 @@ fn in_ofpa(path: &str) -> bool {
     path.split('/').any(is_ofpa_dir)
 }
 
+/// `Anim_X_10` -> `Anim_X` (a trailing `_<digits>` added when a file was renamed after cooking).
+fn strip_numeric_suffix(stem: &str) -> Option<&str> {
+    let i = stem.rfind('_')?;
+    let tail = &stem[i + 1..];
+    (i > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())).then(|| &stem[..i])
+}
+
 fn is_junk(path: &str) -> bool {
     let c: Vec<&str> = path.split('/').collect();
     c.iter().any(|x| x.eq_ignore_ascii_case("__MACOSX"))
@@ -378,6 +385,7 @@ fn plan_content<R: Read + Seek>(
     }
     let mut votes: HashMap<(String, String), (Rule, usize)> = HashMap::new();
     let mut unresolved = 0usize;
+    let mut pending: Vec<Rule> = Vec::new();
     let mut all_refs: BTreeSet<String> = BTreeSet::new();
     for a in &assets {
         let head = read_head(zip, a.index, HEAD_BYTES)?;
@@ -422,6 +430,35 @@ fn plan_content<R: Read + Seek>(
                 }
             }
         }
+        // Tolerant own-path match (only when there is no exact one): the package name is the
+        // file stem minus a trailing `_<digits>`. Used later, and only when its rule equals one
+        // the exact matches voted for, so it can never introduce a new root.
+        let mut tol: Option<(usize, Rule)> = None;
+        if best.is_none() {
+            if let Some(base) = strip_numeric_suffix(&stem) {
+                for c in &cands {
+                    let parts: Vec<&str> = c.trim_start_matches("/Game/").split('/').collect();
+                    if parts.last().map(|s| s.to_ascii_lowercase()).as_deref() != Some(base) {
+                        continue;
+                    }
+                    let gc = &parts[..parts.len() - 1];
+                    let n = gc.len();
+                    let mut s = 0;
+                    while s < m.min(n) && ec[m - 1 - s].eq_ignore_ascii_case(gc[n - 1 - s]) {
+                        s += 1;
+                    }
+                    if tol.as_ref().is_none_or(|(bs, _)| s > *bs) {
+                        tol = Some((
+                            s,
+                            Rule {
+                                zip_prefix: ec[..m - s].join("/"),
+                                game_prefix: gc[..n - s].join("/"),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
         match best {
             Some((_, rule)) if !tie => {
                 let key = (
@@ -430,7 +467,19 @@ fn plan_content<R: Read + Seek>(
                 );
                 votes.entry(key).or_insert((rule, 0)).1 += 1;
             }
-            _ => unresolved += 1,
+            _ => {
+                unresolved += 1;
+                if let Some((_, r)) = tol {
+                    pending.push(r);
+                }
+            }
+        }
+    }
+    for r in pending {
+        let key = (r.zip_prefix.to_lowercase(), r.game_prefix.to_lowercase());
+        if let Some(v) = votes.get_mut(&key) {
+            v.1 += 1;
+            unresolved -= 1;
         }
     }
     let resolved: usize = votes.values().map(|v| v.1).sum();
