@@ -27,6 +27,20 @@ use std::sync::OnceLock;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+/// An entry that could not be extracted (damaged data, truncated archive, ...).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Skipped {
+    pub path: String,
+    pub error: String,
+}
+
+/// Result of converting an archive to a temp zip.
+pub(crate) struct Converted {
+    /// File entries in the archive.
+    pub total: usize,
+    pub skipped: Vec<Skipped>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ArchiveKind {
     Zip,
@@ -386,42 +400,96 @@ fn map_7z(e: sevenz_rust2::Error) -> SanitizeError {
     }
 }
 
-fn sevenz_to_zip(volumes: &[PathBuf], tmp_zip: &Path) -> Result<(), SanitizeError> {
+enum SevenPass {
+    Done(Converted),
+    /// Reading this entry failed; run again without it.
+    DiedAt(String, String),
+}
+
+/// Convert a 7z set to a temp zip. A damaged entry is left out: the pass is repeated with that
+/// entry (and the rest of its solid block) skipped, because a half-written entry cannot be
+/// removed from the zip stream.
+fn sevenz_to_zip(volumes: &[PathBuf], tmp_zip: &Path) -> Result<Converted, SanitizeError> {
+    let mut bad: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for _ in 0..6 {
+        match sevenz_pass(volumes, tmp_zip, &bad)? {
+            SevenPass::Done(c) => return Ok(c),
+            SevenPass::DiedAt(path, err) => {
+                bad.insert(path, err);
+            }
+        }
+    }
+    Err(corrupt("too many damaged entries in the 7z archive"))
+}
+
+fn sevenz_pass(
+    volumes: &[PathBuf],
+    tmp_zip: &Path,
+    bad: &std::collections::HashMap<String, String>,
+) -> Result<SevenPass, SanitizeError> {
+    use sevenz_rust2::EntryDecision;
     let chain = ChainReader::open(volumes)?;
     let mut ar = ArchiveReader::new(BufReader::with_capacity(1 << 20, chain), Password::empty())
         .map_err(map_7z)?;
+    let all_files: Vec<String> = ar
+        .archive()
+        .files
+        .iter()
+        .filter(|f| !f.is_directory() && !f.is_anti_item())
+        .map(|f| f.name().to_string())
+        .collect();
     let mut zw = ZipWriter::new(BufWriter::with_capacity(1 << 20, File::create(tmp_zip)?));
     let mut caps = Caps::default();
     let mut written_total: u64 = 0;
     let mut rejected: Option<SanitizeError> = None;
-    let res = ar.for_each_entries(|entry, rd| {
-        let mut step = || -> Result<(), SanitizeError> {
+    let mut died: Option<(String, String)> = None;
+    let mut last_written: Option<String> = None;
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    let res = ar.for_each_entries_with_decision(|entry, rd| {
+        let mut step = || -> Result<EntryDecision, SanitizeError> {
             let a = entry.windows_attributes();
             let unix_mode = if a & 0x8000 != 0 { a >> 16 } else { 0 };
             if a & 0x400 != 0 || unix_mode & 0xF000 == 0xA000 {
                 return Err(unsafe_("SYMLINK", entry.name()));
             }
             if entry.is_anti_item() {
-                return Ok(());
+                return Ok(EntryDecision::Continue);
             }
             let is_dir = entry.is_directory();
             let path = caps.admit(entry.name(), is_dir, entry.size())?;
             if is_dir {
-                return Ok(());
+                return Ok(EntryDecision::Continue);
+            }
+            visited.insert(entry.name().to_string());
+            if let Some(why) = bad.get(&path) {
+                skipped.push(Skipped {
+                    path,
+                    error: why.clone(),
+                });
+                // Abandon the rest of this compression block (not drained, not validated).
+                return Ok(EntryDecision::SkipBlock);
             }
             zw.start_file(path.as_str(), zip_opts())
                 .map_err(|e| SanitizeError::Io(format!("{path}: {e}")))?;
             let limit = MAX_UNCOMPRESSED.saturating_sub(written_total) + 1;
-            let n = io::copy(&mut rd.take(limit), &mut zw)
-                .map_err(|e| SanitizeError::Io(format!("{path}: {e}")))?;
-            written_total += n;
-            if written_total > MAX_UNCOMPRESSED {
-                return Err(unsafe_("TOO_BIG", "7z entry larger than declared"));
+            match io::copy(&mut rd.take(limit), &mut zw) {
+                Ok(n) => {
+                    written_total += n;
+                    if written_total > MAX_UNCOMPRESSED {
+                        return Err(unsafe_("TOO_BIG", "7z entry larger than declared"));
+                    }
+                    last_written = Some(path);
+                    Ok(EntryDecision::Continue)
+                }
+                Err(e) => {
+                    died = Some((path, format!("read error: {e}")));
+                    Ok(EntryDecision::Stop)
+                }
             }
-            Ok(())
         };
         match step() {
-            Ok(()) => Ok(true),
+            Ok(d) => Ok(d),
             Err(e) => {
                 rejected = Some(e);
                 Err(sevenz_rust2::Error::Other("rejected".into()))
@@ -431,9 +499,36 @@ fn sevenz_to_zip(volumes: &[PathBuf], tmp_zip: &Path) -> Result<(), SanitizeErro
     if let Some(r) = rejected {
         return Err(r);
     }
-    res.map_err(map_7z)?;
+    if let Some((p, e)) = died {
+        return Ok(SevenPass::DiedAt(p, e));
+    }
+    if let Err(e) = res {
+        use sevenz_rust2::Error as E;
+        if matches!(e, E::PasswordRequired | E::MaybeBadPassword(_)) {
+            return Err(map_7z(e));
+        }
+        // Integrity failure while draining the entry we just wrote (checksum, decoder).
+        return match last_written {
+            Some(p) => Ok(SevenPass::DiedAt(p, format!("damaged data: {e}"))),
+            None => Err(map_7z(e)),
+        };
+    }
+    // Entries never reached because their solid block was abandoned.
+    for raw in &all_files {
+        if !visited.contains(raw) {
+            skipped.push(Skipped {
+                path: normalize_name(raw).unwrap_or_else(|_| raw.clone()),
+                error: "not extracted: an earlier entry in the same solid block is damaged"
+                    .to_string(),
+            });
+        }
+    }
     caps.finish()?;
-    finish_zip(zw)
+    finish_zip(zw)?;
+    Ok(SevenPass::Done(Converted {
+        total: all_files.len(),
+        skipped,
+    }))
 }
 
 // ---------------------------------------------------------------- RAR
@@ -467,13 +562,40 @@ fn slot_name(i: usize) -> String {
     format!("f{i:06}")
 }
 
-fn rar_to_zip(first: &Path, library_dir: &Path, tmp_zip: &Path) -> Result<(), SanitizeError> {
+/// Per-entry extraction failures we tolerate (the rest of the archive can still be good).
+fn rar_entry_failure(e: &unrar::error::UnrarError) -> bool {
+    use unrar::error::Code;
+    matches!(
+        e.code,
+        Code::BadData | Code::EOpen | Code::ERead | Code::BadArchive | Code::EReference
+    )
+}
+
+fn rar_fatal(e: &unrar::error::UnrarError) -> bool {
+    use unrar::error::Code;
+    matches!(e.code, Code::MissingPassword | Code::BadPassword)
+}
+
+fn rar_to_zip(
+    first: &Path,
+    library_dir: &Path,
+    tmp_zip: &Path,
+) -> Result<Converted, SanitizeError> {
     // Pass 1: list and validate every header before anything is written.
     let mut caps = Caps::default();
     let mut files: Vec<String> = Vec::new();
     let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut listing_error: Option<String> = None;
     for h in Archive::new(first).open_for_listing().map_err(map_rar)? {
-        let h = h.map_err(map_rar)?;
+        let h = match h {
+            Ok(h) => h,
+            // A damaged / cut-off tail: keep what was listed, the rest counts as failed.
+            Err(e) if rar_entry_failure(&e) => {
+                listing_error = Some(format!("{e}"));
+                break;
+            }
+            Err(e) => return Err(map_rar(e)),
+        };
         let raw = h.filename.to_string_lossy().to_string();
         if h.is_encrypted() {
             return Err(unsafe_("ENCRYPTED", raw));
@@ -491,38 +613,98 @@ fn rar_to_zip(first: &Path, library_dir: &Path, tmp_zip: &Path) -> Result<(), Sa
 
     // Pass 2: extract under short sequential names (`f000001`): unrar uses Win32 paths that
     // fail on >260 characters or non-ASCII names, so the real (validated) entry name is only
-    // applied when the file is written into the output zip.
+    // applied when the file is written into the output zip. A damaged entry is recorded and
+    // skipped: the archive is reopened and extraction continues after it (non-solid), or the
+    // remaining entries count as failed (solid: later entries depend on the broken one).
     let dir = TempDir(library_dir.join(format!(".tmp-{}", &unique_token()[..8])));
     fs::create_dir_all(&dir.0)?;
-    let mut cur = Some(Archive::new(first).open_for_processing().map_err(map_rar)?);
+    let mut done = vec![false; files.len()];
+    let mut failed: Vec<Option<String>> = vec![None; files.len()];
+    let mut stop_reason = String::new();
     let mut actual: u64 = 0;
-    while let Some(ar) = cur.take() {
-        let Some(h) = ar.read_header().map_err(map_rar)? else {
-            break;
-        };
-        if h.entry().is_directory() {
-            cur = Some(h.skip().map_err(map_rar)?);
-            continue;
+    let mut resume_from = 0usize; // header index to start extracting at
+    loop {
+        let ar = Archive::new(first).open_for_processing().map_err(map_rar)?;
+        let solid = ar.is_solid();
+        let mut cur = Some(ar);
+        let mut i = 0usize;
+        let mut stopped_at: Option<usize> = None;
+        while let Some(a) = cur.take() {
+            let h = match a.read_header() {
+                Ok(Some(h)) => h,
+                Ok(None) => break,
+                Err(e) if rar_fatal(&e) => return Err(map_rar(e)),
+                Err(e) => {
+                    stop_reason = format!("header read failed: {e}");
+                    break;
+                }
+            };
+            if i < resume_from || h.entry().is_directory() {
+                match h.skip() {
+                    Ok(n) => cur = Some(n),
+                    Err(e) if rar_fatal(&e) => return Err(map_rar(e)),
+                    Err(e) => {
+                        stop_reason = format!("skipping an entry failed: {e}");
+                        break;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            let raw = h.entry().filename.to_string_lossy().to_string();
+            let path = normalize_name(&raw).map_err(SanitizeError::NeedsReview)?;
+            let Some(&slot) = slot_of.get(&path) else {
+                if let Some(le) = &listing_error {
+                    stop_reason = format!("entry after the damaged tail: {le}");
+                    break;
+                }
+                return Err(corrupt(format!("{path}: entry not in the header listing")));
+            };
+            let dest = dir.0.join(slot_name(slot));
+            match h.extract_to(&dest) {
+                Ok(n) => {
+                    cur = Some(n);
+                    let md = fs::symlink_metadata(&dest)?;
+                    if md.file_type().is_symlink() {
+                        return Err(unsafe_("SYMLINK", path));
+                    }
+                    actual = actual.saturating_add(md.len());
+                    if actual > MAX_UNCOMPRESSED {
+                        return Err(unsafe_("TOO_BIG", "rar content larger than the cap"));
+                    }
+                    done[slot] = true;
+                }
+                Err(e) if rar_entry_failure(&e) => {
+                    failed[slot] = Some(format!("{e}"));
+                    stopped_at = Some(i);
+                    if solid {
+                        stop_reason = "solid archive cannot continue after a damaged entry".into();
+                    }
+                    break;
+                }
+                Err(e) => return Err(map_rar(e)),
+            }
+            i += 1;
         }
-        let raw = h.entry().filename.to_string_lossy().to_string();
-        let path = normalize_name(&raw).map_err(SanitizeError::NeedsReview)?;
-        let Some(slot) = slot_of.get(&path) else {
-            return Err(corrupt(format!("{path}: entry not in the header listing")));
-        };
-        let dest = dir.0.join(slot_name(*slot));
-        cur = Some(h.extract_to(&dest).map_err(map_rar)?);
-        let md = fs::symlink_metadata(&dest)?;
-        if md.file_type().is_symlink() {
-            return Err(unsafe_("SYMLINK", path));
+        match stopped_at {
+            Some(k) if !solid => resume_from = k + 1,
+            _ => break,
         }
-        actual = actual.saturating_add(md.len());
-        if actual > MAX_UNCOMPRESSED {
-            return Err(unsafe_("TOO_BIG", "rar content larger than the cap"));
-        }
+    }
+    if stop_reason.is_empty() {
+        stop_reason = "not extracted (archive ended early)".into();
     }
 
     let mut zw = ZipWriter::new(BufWriter::with_capacity(1 << 20, File::create(tmp_zip)?));
+    let mut skipped: Vec<Skipped> = Vec::new();
     for (slot, path) in files.iter().enumerate() {
+        if !done[slot] {
+            skipped.push(Skipped {
+                path: path.clone(),
+                error: failed[slot].clone().unwrap_or_else(|| stop_reason.clone()),
+            });
+            continue;
+        }
         let src = dir.0.join(slot_name(slot));
         let md = fs::symlink_metadata(&src)
             .map_err(|_| corrupt(format!("{path}: not extracted (damaged rar?)")))?;
@@ -534,7 +716,17 @@ fn rar_to_zip(first: &Path, library_dir: &Path, tmp_zip: &Path) -> Result<(), Sa
         let mut f = File::open(&src)?;
         io::copy(&mut f, &mut zw).map_err(|e| SanitizeError::Io(format!("{path}: {e}")))?;
     }
-    finish_zip(zw)
+    finish_zip(zw)?;
+    let mut total = files.len();
+    if let Some(le) = listing_error {
+        // Entries behind the damage are unknown: count them as one failed item.
+        total += 1;
+        skipped.push(Skipped {
+            path: "(entries after the damaged end of the archive)".into(),
+            error: le,
+        });
+    }
+    Ok(Converted { total, skipped })
 }
 
 use unrar::Archive;
@@ -579,6 +771,8 @@ pub fn sanitize_archive_with(
         format: kind.label(),
         extra: serde_json::Map::new(),
         engine_version: None,
+        skipped: Vec::new(),
+        total: 0,
     };
     convert_and_sanitize(kind, volumes, library_dir, &sov, opts)
 }
@@ -603,12 +797,45 @@ pub(crate) fn convert_and_sanitize(
     let converted = match kind {
         ArchiveKind::SevenZ => sevenz_to_zip(volumes, &tmp_zip),
         ArchiveKind::Rar => rar_to_zip(first, library_dir, &tmp_zip),
-        ArchiveKind::SplitZip => concat_to(volumes, &tmp_zip),
+        ArchiveKind::SplitZip => concat_to(volumes, &tmp_zip).map(|()| Converted {
+            total: 0,
+            skipped: Vec::new(),
+        }),
         ArchiveKind::Zip => unreachable!(),
     };
-    let result = converted.and_then(|()| sanitize_zip_with(&tmp_zip, library_dir, Some(sov), opts));
+    let result = converted.and_then(|conv| {
+        let mut sov2 = sov.clone();
+        if !conv.skipped.is_empty() {
+            let ratio = extract_ratio(conv.total, conv.skipped.len());
+            if ratio < opts.min_extract_success_ratio {
+                return Err(corrupt_code(format!(
+                    "{} of {} entries could not be extracted (ratio {:.3} < {:.3})",
+                    conv.skipped.len(),
+                    conv.total,
+                    ratio,
+                    opts.min_extract_success_ratio
+                )));
+            }
+        }
+        sov2.skipped.extend(conv.skipped);
+        sov2.total = conv.total;
+        sanitize_zip_with(&tmp_zip, library_dir, Some(&sov2), opts)
+    });
     let _ = fs::remove_file(&tmp_zip);
     result
+}
+
+/// Share of entries that extracted fine.
+pub(crate) fn extract_ratio(total: usize, skipped: usize) -> f64 {
+    if total == 0 {
+        1.0
+    } else {
+        1.0 - skipped.min(total) as f64 / total as f64
+    }
+}
+
+fn corrupt_code(detail: String) -> SanitizeError {
+    SanitizeError::Corrupt(format!("ARCHIVE_CORRUPT: {detail}"))
 }
 
 fn concat_to(volumes: &[PathBuf], out: &Path) -> Result<(), SanitizeError> {
@@ -710,6 +937,15 @@ mod tests {
         assert_eq!(get("G.zip").kind, ArchiveKind::Zip);
         let h = get("H.zip.001");
         assert!(h.complete && h.kind == ArchiveKind::SplitZip && h.volumes.len() == 2);
+    }
+
+    #[test]
+    fn extraction_ratio() {
+        assert_eq!(extract_ratio(0, 0), 1.0);
+        assert_eq!(extract_ratio(1117, 0), 1.0);
+        assert!(extract_ratio(1117, 1) > 0.95);
+        assert!(extract_ratio(100, 6) < 0.95);
+        assert_eq!(extract_ratio(10, 20), 0.0);
     }
 
     #[test]

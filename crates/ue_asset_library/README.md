@@ -107,6 +107,9 @@ back to the import root.
   "lease_secs": 300,
   "heartbeat_secs": 60,
   "max_reclaims": 3,
+  "max_attempts": 5,
+  "retry_min_age_secs": 600,
+  "min_extract_success_ratio": 0.95,
   "prefer_engine_versions": ["5.8"]
 }
 ```
@@ -122,6 +125,19 @@ back to the import root.
   archive's. Inner archives with different base names -> `needs-review` code `NESTED_AMBIGUOUS`;
   more than 2 nesting levels -> `NESTED_TOO_DEEP`. Entries must be single-file zip/7z/rar.
 * `lease_secs` / `heartbeat_secs` / `max_reclaims`: claim leases, see "Stale claims" below.
+* `max_attempts` (5) / `retry_min_age_secs` (600): retryable errors (truncated, unreadable,
+  missing volume) are counted in `processing/<name>.attempts` (it survives the put-back). After
+  `max_attempts` attempts AND once the first attempt is `retry_min_age_secs` old, the set moves to
+  `failed/` with `<name>.error.txt` and `<name>.review.json` (code `RETRIES_EXCEEDED`, last error
+  included). Busy (sharing violation) and not-yet-stable files never count.
+* `min_extract_success_ratio` (0.95): entries that fail to extract from a `.rar`/`.7z` (damaged
+  data, truncated archive) or whose asset header cannot be read are skipped when at least this
+  share of the entries is fine. They are left out of the library zip and the layout vote, and the
+  sidecar records `extra.skipped_entries` (`[{path, error}]`) and `extra.extract_success_ratio`;
+  the log prints a `WARN` line and the item lands in the library normally. Below the ratio the
+  item goes to `failed/` with code `ARCHIVE_CORRUPT`. For RAR, extraction reopens the archive and
+  continues after a bad entry (non-solid); a solid archive cannot continue, so its remaining
+  entries count as failed. A damaged 7z entry also drops the rest of its solid block.
 * `poll_secs`, `stable_secs`, `stale_mins` are optional (defaults shown). Unknown keys are
   rejected so typos do not pass silently.
 * Relative paths are resolved against the config file's folder. Use forward slashes or

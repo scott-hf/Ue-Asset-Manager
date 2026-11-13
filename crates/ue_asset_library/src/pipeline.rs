@@ -33,7 +33,13 @@ pub struct Config {
     /// A claim without a zip in `processing/` is removed after this long.
     pub claim_grace_secs: u64,
     /// Attempts for truncated / busy zips before they move to `failed/`.
+    /// Attempts for retryable errors (truncated, unreadable, missing volume) before the item
+    /// goes to `failed/`; busy / unstable files never count.
     pub max_retries: u32,
+    /// ...and the first attempt must be at least this old (an upload may still be running).
+    pub retry_min_age_secs: u64,
+    /// Minimum share of archive entries that must extract fine (see `SanitizeOptions`).
+    pub min_extract_success_ratio: f64,
     /// A claim is valid this long after its owner's last heartbeat.
     pub lease_secs: u64,
     /// The owner refreshes its lease this often.
@@ -64,7 +70,9 @@ impl Config {
             requeue: false,
             tmp_age_secs: 900,
             claim_grace_secs: 300,
-            max_retries: 3,
+            max_retries: 5,
+            retry_min_age_secs: 600,
+            min_extract_success_ratio: 0.95,
             lease_secs: 300,
             heartbeat_secs: 60,
             lease_grace_secs: crate::lease::default_grace(300),
@@ -248,6 +256,8 @@ pub struct PassReport {
     pub deferred: Vec<String>,
     pub busy: Vec<String>,
     pub loose_files: Vec<String>,
+    /// Items that landed in the library with skipped (unreadable) entries.
+    pub warnings: Vec<String>,
     /// Multi-volume sets with a missing volume (they wait; nothing is moved).
     pub waiting: Vec<String>,
     /// Zips seen but not yet stable.
@@ -262,6 +272,7 @@ impl PassReport {
         self.failed.extend(o.failed);
         self.deferred.extend(o.deferred);
         self.busy.extend(o.busy);
+        self.warnings.extend(o.warnings);
         for l in o.waiting {
             if !self.waiting.contains(&l) {
                 self.waiting.push(l);
@@ -289,7 +300,6 @@ impl PassReport {
 pub struct State {
     /// Stability tracking keyed by full path (the same name can sit in both inboxes).
     seen: HashMap<PathBuf, (u64, Option<SystemTime>, Instant)>,
-    attempts: HashMap<String, u32>,
 }
 
 /// Final state reached: drop the claim file and the reclaim counter.
@@ -297,6 +307,7 @@ fn release_claim(claim: &Claim) {
     let _ = fs::remove_file(&claim.claim_path);
     if let Some(dir) = claim.claim_path.parent() {
         let _ = fs::remove_file(dir.join(format!("{}.retries", claim.name)));
+        let _ = fs::remove_file(dir.join(format!("{}.attempts", claim.name)));
     }
 }
 
@@ -481,13 +492,14 @@ fn move_claim_files(claim: &Claim, dest: &Path) -> std::io::Result<PathBuf> {
 fn process_claim(
     cfg: &Config,
     dirs: &Dirs,
-    state: &mut State,
+    _state: &mut State,
     claim: Claim,
     rep: &mut PassReport,
     log: &mut dyn FnMut(&str),
 ) {
     let name = claim.name.clone();
-    let opts = SanitizeOptions::new(cfg.prefer_engine_versions.clone());
+    let opts = SanitizeOptions::new(cfg.prefer_engine_versions.clone())
+        .with_min_extract_success_ratio(cfg.min_extract_success_ratio);
     let heartbeat = start_heartbeat(claim.claim_path.clone(), cfg.lease_params());
     let outcome = run_sanitize(&claim, &cfg.library_dir, &opts);
     // Stop beating before any final move so a late beat cannot recreate the claim file.
@@ -504,7 +516,23 @@ fn process_claim(
                 sidecar.kind,
                 sidecar.entry_count
             ));
-            state.attempts.remove(&name);
+            if let Some(list) = sidecar
+                .extra
+                .get("skipped_entries")
+                .and_then(|v| v.as_array())
+            {
+                let w = format!(
+                    "{name}: {} entries skipped (extract success ratio {}); see sidecar extra.skipped_entries",
+                    list.len(),
+                    sidecar
+                        .extra
+                        .get("extract_success_ratio")
+                        .map(|r| r.to_string())
+                        .unwrap_or_default()
+                );
+                log(&format!("WARN: {w}"));
+                rep.warnings.push(w);
+            }
             finish_move(&claim, &dirs.processed, &name, rep, log);
             rep.sanitized.push(name);
         }
@@ -532,41 +560,51 @@ fn process_claim(
             send_to_review(dirs, &claim, &nr);
             rep.needs_review.push(name);
         }
+        Err(SanitizeError::Busy(m)) => {
+            // In use by another process: wait, never counted.
+            log(&format!("{name}: busy ({m}); putting back"));
+            put_back(&claim, &name, log);
+            rep.deferred.push(name);
+        }
         Err(SanitizeError::Truncated(m)) | Err(SanitizeError::Io(m)) => {
-            let waiting_for_volume = m.starts_with("MISSING_VOLUME");
-            let n = state.attempts.entry(name.clone()).or_insert(0);
-            if !waiting_for_volume {
-                *n += 1;
+            // Persistent attempt counter (survives put-back): count, then cap.
+            let path = dirs.processing.join(format!("{name}.attempts"));
+            let mut at = read_attempts(&path);
+            let now = unix_secs();
+            if at.count == 0 {
+                at.first_unix = now;
             }
-            if !waiting_for_volume && *n >= cfg.max_retries {
-                log(&format!("{name}: giving up after {n} attempts: {m}"));
-                send_to_failed(dirs, &claim, &m);
-                state.attempts.remove(&name);
+            at.count += 1;
+            at.last_error = m.clone();
+            let age = now.saturating_sub(at.first_unix);
+            if at.count >= cfg.max_retries && age >= cfg.retry_min_age_secs {
+                log(&format!(
+                    "{name}: giving up after {} attempts over {age}s: {m}",
+                    at.count
+                ));
+                send_to_failed(
+                    dirs,
+                    &claim,
+                    &format!(
+                        "RETRIES_EXCEEDED: {} attempts over {age}s, last error: {m}",
+                        at.count
+                    ),
+                    "RETRIES_EXCEEDED",
+                );
                 rep.failed.push(name);
             } else {
                 log(&format!(
-                    "{name}: not readable yet ({m}); attempt {n}, putting back"
+                    "{name}: not readable yet ({m}); attempt {}/{} (first {age}s ago), putting back",
+                    at.count, cfg.max_retries
                 ));
-                let mut put_back_ok = true;
-                for v in std::iter::once(&claim.zip_path).chain(claim.extra_volumes.iter()) {
-                    let Some(vn) = v.file_name() else { continue };
-                    if let Err(e) = fs::rename(v, claim.origin.join(vn)) {
-                        put_back_ok = false;
-                        log(&format!(
-                            "{name}: could not put back {}: {e}",
-                            vn.to_string_lossy()
-                        ));
-                    }
-                }
-                if put_back_ok {
-                    let _ = fs::remove_file(&claim.claim_path);
-                }
+                let _ = fs::write(&path, serde_json::to_vec(&at).unwrap_or_default());
+                put_back(&claim, &name, log);
                 rep.deferred.push(name);
             }
         }
         Err(SanitizeError::Corrupt(m)) => {
             log(&format!("{name}: corrupt: {m}"));
-            send_to_failed(dirs, &claim, &m);
+            send_to_failed(dirs, &claim, &m, "CORRUPT");
             rep.failed.push(name);
         }
     }
@@ -614,7 +652,7 @@ fn send_to_review(dirs: &Dirs, claim: &Claim, nr: &NeedsReview) {
     release_claim(claim);
 }
 
-fn send_to_failed(dirs: &Dirs, claim: &Claim, why: &str) {
+fn send_to_failed(dirs: &Dirs, claim: &Claim, why: &str, default_code: &str) {
     let moved = move_claim_files(claim, &dirs.failed);
     let base = moved
         .as_ref()
@@ -622,7 +660,59 @@ fn send_to_failed(dirs: &Dirs, claim: &Claim, why: &str) {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| claim.name.clone());
     write_note(&dirs.failed, &base, ".error.txt", &format!("{why}\n"));
+    // A leading `CODE:` in the message is the diagnostic code.
+    let code = why
+        .split_once(':')
+        .map(|(c, _)| c)
+        .filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+        .unwrap_or(default_code);
+    let json = serde_json::json!({
+        "schema": 1,
+        "source_zip": claim.name,
+        "code": code,
+        "detail": why,
+        "at": rfc3339_utc(unix_secs()),
+    });
+    let _ = fs::write(
+        dirs.failed.join(format!("{base}.review.json")),
+        serde_json::to_vec_pretty(&json).unwrap_or_default(),
+    );
     release_claim(claim);
+}
+
+/// Move every volume back to where it came from (retry later).
+fn put_back(claim: &Claim, name: &str, log: &mut dyn FnMut(&str)) {
+    let mut ok = true;
+    for v in std::iter::once(&claim.zip_path).chain(claim.extra_volumes.iter()) {
+        let Some(vn) = v.file_name() else { continue };
+        if let Err(e) = fs::rename(v, claim.origin.join(vn)) {
+            ok = false;
+            log(&format!(
+                "{name}: could not put back {}: {e}",
+                vn.to_string_lossy()
+            ));
+        }
+    }
+    if ok {
+        let _ = fs::remove_file(&claim.claim_path);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Attempts {
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    first_unix: u64,
+    #[serde(default)]
+    last_error: String,
+}
+
+fn read_attempts(path: &Path) -> Attempts {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 /// One-shot: reconcile is the caller's job; this scans, waits one stability

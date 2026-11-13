@@ -18,6 +18,9 @@ pub struct SanitizeOptions {
     /// Engine versions to prefer when an archive wraps one inner archive per version
     /// (order = priority). When none matches, the highest version found is used.
     pub prefer_engine_versions: Vec<String>,
+    /// Minimum share of entries that must extract/read fine; below it the item fails with
+    /// `ARCHIVE_CORRUPT`, at or above it bad entries are skipped and recorded in the sidecar.
+    pub min_extract_success_ratio: f64,
     pub(crate) depth: u8,
 }
 
@@ -31,13 +34,20 @@ impl SanitizeOptions {
     pub fn new(prefer_engine_versions: Vec<String>) -> Self {
         SanitizeOptions {
             prefer_engine_versions,
+            min_extract_success_ratio: 0.95,
             depth: 0,
         }
+    }
+
+    pub fn with_min_extract_success_ratio(mut self, ratio: f64) -> Self {
+        self.min_extract_success_ratio = ratio;
+        self
     }
 
     pub(crate) fn deeper(&self) -> Self {
         SanitizeOptions {
             prefer_engine_versions: self.prefer_engine_versions.clone(),
+            min_extract_success_ratio: self.min_extract_success_ratio,
             depth: self.depth + 1,
         }
     }
@@ -59,7 +69,7 @@ fn map_open_error(e: ZipError) -> SanitizeError {
     match e {
         ZipError::Io(io) => {
             if is_busy_error(&io) {
-                SanitizeError::Io(io.to_string())
+                SanitizeError::Busy(io.to_string())
             } else {
                 SanitizeError::Truncated(io.to_string())
             }
@@ -95,6 +105,10 @@ pub(crate) struct SourceOverride {
     pub extra: serde_json::Map<String, serde_json::Value>,
     /// Engine version of a chosen nested archive.
     pub engine_version: Option<String>,
+    /// Entries that failed to extract while converting the original archive.
+    pub skipped: Vec<crate::archive::Skipped>,
+    /// Number of file entries in the original archive (0 = plain zip).
+    pub total: usize,
 }
 
 fn find_duplicate(library_dir: &Path, sha12: &str) -> Option<PathBuf> {
@@ -203,6 +217,8 @@ pub(crate) fn sanitize_zip_with(
             format: ov.map(|o| o.format).unwrap_or("zip"),
             extra: ov.map(|o| o.extra.clone()).unwrap_or_default(),
             engine_version: None,
+            skipped: ov.map(|o| o.skipped.clone()).unwrap_or_default(),
+            total: ov.map(|o| o.total).unwrap_or(0),
         };
         return crate::nested::run(&mut archive, &cands, library_dir, &base, opts);
     }
@@ -210,6 +226,32 @@ pub(crate) fn sanitize_zip_with(
     drop(archive);
     if layout.renames.is_empty() {
         return Err(SanitizeError::NeedsReview(NeedsReview::NoContent));
+    }
+
+    // Skipped entries: failed extraction (archive) plus unreadable assets (layout).
+    let mut skipped: Vec<crate::archive::Skipped> =
+        ov.map(|o| o.skipped.clone()).unwrap_or_default();
+    skipped.extend(layout.skipped.iter().map(|(p, e)| crate::archive::Skipped {
+        path: p.clone(),
+        error: e.clone(),
+    }));
+    let total_entries = match ov.map(|o| o.total).unwrap_or(0) {
+        0 => layout.renames.len() + layout.skipped.len(),
+        t => t,
+    };
+    let ratio = if total_entries == 0 {
+        1.0
+    } else {
+        1.0 - skipped.len() as f64 / total_entries as f64
+    };
+    if !skipped.is_empty() && ratio < opts.min_extract_success_ratio {
+        return Err(SanitizeError::Corrupt(format!(
+            "ARCHIVE_CORRUPT: only {} of {} entries are readable (ratio {:.3} < {:.3})",
+            total_entries - skipped.len().min(total_entries),
+            total_entries,
+            ratio,
+            opts.min_extract_success_ratio
+        )));
     }
 
     let cn = clean_name_ranged(&stem);
@@ -229,6 +271,21 @@ pub(crate) fn sanitize_zip_with(
     if let Some((lo, hi)) = &cn.range {
         extra.insert("engine_version_min".into(), lo.clone().into());
         extra.insert("engine_version_max".into(), hi.clone().into());
+    }
+    if !skipped.is_empty() {
+        extra.insert(
+            "skipped_entries".into(),
+            serde_json::Value::Array(
+                skipped
+                    .iter()
+                    .map(|s| serde_json::json!({"path": s.path, "error": s.error}))
+                    .collect(),
+            ),
+        );
+        extra.insert(
+            "extract_success_ratio".into(),
+            serde_json::json!((ratio * 10_000.0).round() / 10_000.0),
+        );
     }
     if let Some(o) = ov {
         extra.insert("source_format".into(), o.format.into());

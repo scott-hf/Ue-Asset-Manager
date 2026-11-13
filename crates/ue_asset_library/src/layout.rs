@@ -41,6 +41,8 @@ pub struct Layout {
     pub entry_count: u64,
     pub total_uncompressed: u64,
     pub unresolved_assets: usize,
+    /// Assets whose header could not be read; left out of the output (path, error).
+    pub skipped: Vec<(String, String)>,
 }
 
 fn comps(p: &str) -> Vec<&str> {
@@ -228,6 +230,7 @@ fn finish(
         marketplace_url: None,
         external_refs: Vec::new(),
         unresolved_assets: 0,
+        skipped: Vec::new(),
     })
 }
 
@@ -386,9 +389,16 @@ fn plan_content<R: Read + Seek>(
     let mut votes: HashMap<(String, String), (Rule, usize)> = HashMap::new();
     let mut unresolved = 0usize;
     let mut pending: Vec<Rule> = Vec::new();
+    let mut skipped_assets: Vec<(String, String)> = Vec::new();
     let mut all_refs: BTreeSet<String> = BTreeSet::new();
     for a in &assets {
-        let head = read_head(zip, a.index, HEAD_BYTES)?;
+        let head = match read_head(zip, a.index, HEAD_BYTES) {
+            Ok(h) => h,
+            Err(e) => {
+                skipped_assets.push((a.path.clone(), e.to_string()));
+                continue;
+            }
+        };
         let cands = extract_game_paths(&head);
         for c in &cands {
             all_refs.insert(c.clone());
@@ -523,6 +533,9 @@ fn plan_content<R: Read + Seek>(
     let mut ofpa_roots: BTreeSet<String> = BTreeSet::new();
     let mut root_names: HashMap<String, String> = HashMap::new();
     for e in files {
+        if skipped_assets.iter().any(|(p, _)| *p == e.path) {
+            continue;
+        }
         let rel: Option<Vec<&str>> = if zc.is_empty() {
             Some(e.path.split('/').collect())
         } else {
@@ -598,5 +611,6 @@ fn plan_content<R: Read + Seek>(
         .collect();
     l.content_folder = Some(folder);
     l.unresolved_assets = unresolved;
+    l.skipped = skipped_assets;
     Ok(l)
 }

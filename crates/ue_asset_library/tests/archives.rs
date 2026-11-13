@@ -310,3 +310,139 @@ fn pipeline_review_moves_all_volumes() {
     assert!(dirs.needs_review.join("Bad.7z.002").is_file());
     assert!(dirs.needs_review.join("Bad.7z.001.review.json").is_file());
 }
+
+// ---------- partial extraction tolerance and retry cap ----------
+
+fn pad_entries(n: usize) -> Vec<(String, Vec<u8>)> {
+    let mut seed = 0x1234_5678u32;
+    (0..n)
+        .map(|i| {
+            let data: Vec<u8> = (0..2000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            (format!("OperatingRoomPack/Materials/pad_{i:03}.bin"), data)
+        })
+        .collect()
+}
+
+fn damaged_7z(path: &Path) {
+    let mut e = room_entries();
+    e.extend(pad_entries(60));
+    make_7z(path, &e);
+    let mut bytes = fs::read(path).unwrap();
+    let pos = 32 + (bytes.len() - 32) / 3;
+    for b in &mut bytes[pos..pos + 16] {
+        *b ^= 0xFF;
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn damaged_7z_entry_is_skipped_and_recorded() {
+    let t = Tmp::new();
+    let src = t.dir("src").join("Damaged Pack 5.1.7z");
+    damaged_7z(&src);
+    let lib = t.dir("lib");
+    let (zip, sc) = sanitized(sanitize_archive(
+        ArchiveKind::SevenZ,
+        std::slice::from_ref(&src),
+        &lib,
+    ));
+    let skipped = sc.extra["skipped_entries"].as_array().unwrap();
+    assert!(!skipped.is_empty() && skipped.len() <= 3, "{skipped:?}");
+    assert!(sc.extra["extract_success_ratio"].as_f64().unwrap() >= 0.95);
+    let z = ZipArchive::new(fs::File::open(&zip).unwrap()).unwrap();
+    for s in skipped {
+        let p = s["path"].as_str().unwrap();
+        assert!(!s["error"].as_str().unwrap().is_empty());
+        assert!(
+            !z.file_names()
+                .any(|n| n.ends_with(p.rsplit('/').next().unwrap())),
+            "{p} must not be in the library zip"
+        );
+    }
+    assert_eq!(sc.kind, Kind::Content);
+}
+
+#[test]
+fn damaged_7z_below_ratio_fails_as_archive_corrupt() {
+    use ue_asset_library::SanitizeOptions;
+    let t = Tmp::new();
+    let src = t.dir("src").join("Damaged Pack 5.1.7z");
+    damaged_7z(&src);
+    let opts = SanitizeOptions::default().with_min_extract_success_ratio(0.999);
+    match ue_asset_library::sanitize_archive_with(
+        ArchiveKind::SevenZ,
+        std::slice::from_ref(&src),
+        &t.dir("lib"),
+        &opts,
+    ) {
+        Err(SanitizeError::Corrupt(m)) => assert!(m.starts_with("ARCHIVE_CORRUPT"), "{m}"),
+        o => panic!("{o:?}"),
+    }
+}
+
+#[test]
+fn retryable_errors_are_capped_with_a_persistent_counter() {
+    let t = Tmp::new();
+    let import = t.dir("import");
+    let lib = t.dir("library");
+    let mut cfg = Config::new(&import, &lib);
+    cfg.stable_secs = 0;
+    cfg.max_retries = 3;
+    cfg.retry_min_age_secs = 0;
+    let dirs = Dirs::new(&import);
+    dirs.create_all().unwrap();
+    fs::write(import.join("Cut 5.0.zip"), b"PK\x03\x04 truncated upload").unwrap();
+    let mut lines = Vec::new();
+    for n in 1..=2 {
+        let rep = run_once(&cfg, &mut |l| lines.push(l.to_string()));
+        assert_eq!(
+            rep.deferred,
+            vec!["Cut 5.0.zip".to_string()],
+            "pass {n}: {lines:?}"
+        );
+        assert!(import.join("Cut 5.0.zip").is_file());
+        let at = fs::read_to_string(dirs.processing.join("Cut 5.0.zip.attempts")).unwrap();
+        assert!(at.contains(&format!("\"count\":{n}")), "{at}");
+        assert!(
+            lines.iter().any(|l| l.contains(&format!("attempt {n}/3"))),
+            "real attempt number in the log: {lines:?}"
+        );
+    }
+    let rep = run_once(&cfg, &mut |l| lines.push(l.to_string()));
+    assert_eq!(rep.failed, vec!["Cut 5.0.zip".to_string()], "{lines:?}");
+    assert!(dirs.failed.join("Cut 5.0.zip").is_file());
+    let review = fs::read_to_string(dirs.failed.join("Cut 5.0.zip.review.json")).unwrap();
+    assert!(review.contains("RETRIES_EXCEEDED"), "{review}");
+    assert!(!dirs.processing.join("Cut 5.0.zip.attempts").exists());
+}
+
+#[test]
+fn retry_cap_waits_for_the_minimum_age() {
+    let t = Tmp::new();
+    let import = t.dir("import");
+    let lib = t.dir("library");
+    let mut cfg = Config::new(&import, &lib);
+    cfg.stable_secs = 0;
+    cfg.max_retries = 2;
+    cfg.retry_min_age_secs = 3600;
+    Dirs::new(&import).create_all().unwrap();
+    fs::write(import.join("Slow 5.0.zip"), b"PK\x03\x04 partial").unwrap();
+    for _ in 0..4 {
+        let rep = run_once(&cfg, &mut |_| {});
+        assert!(rep.failed.is_empty(), "{rep:?}");
+        assert_eq!(rep.deferred.len(), 1);
+    }
+}
+
+#[test]
+fn busy_io_errors_do_not_count_as_attempts() {
+    let busy = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(matches!(SanitizeError::from(busy), SanitizeError::Busy(_)));
+    let other = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+    assert!(matches!(SanitizeError::from(other), SanitizeError::Io(_)));
+}

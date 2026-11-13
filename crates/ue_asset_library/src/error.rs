@@ -81,8 +81,10 @@ pub enum SanitizeError {
     NeedsReview(NeedsReview),
     /// The archive looks incomplete (no central directory): retry later.
     Truncated(String),
-    /// Transient I/O problem (busy file, share hiccup): retry later.
+    /// Transient I/O problem (share hiccup, unreadable file): retried, counted as an attempt.
     Io(String),
+    /// The file is in use by another process (sharing violation): retried, never counted.
+    Busy(String),
     /// The archive is unreadable for good.
     Corrupt(String),
 }
@@ -93,6 +95,7 @@ impl fmt::Display for SanitizeError {
             SanitizeError::NeedsReview(n) => write!(f, "needs review: {n}"),
             SanitizeError::Truncated(s) => write!(f, "truncated or incomplete zip: {s}"),
             SanitizeError::Io(s) => write!(f, "i/o error: {s}"),
+            SanitizeError::Busy(s) => write!(f, "file busy: {s}"),
             SanitizeError::Corrupt(s) => write!(f, "corrupt zip: {s}"),
         }
     }
@@ -102,6 +105,9 @@ impl std::error::Error for SanitizeError {}
 
 impl From<std::io::Error> for SanitizeError {
     fn from(e: std::io::Error) -> Self {
+        if crate::util::is_busy_error(&e) {
+            return SanitizeError::Busy(e.to_string());
+        }
         SanitizeError::Io(e.to_string())
     }
 }

@@ -10,7 +10,7 @@ use ue_asset_library::config::{
 const USAGE: &str = "usage:\n  \
 ue_asset_sanitizer [--config <sanitizer.json>] [--once|--watch] [options]\n  \
 ue_asset_sanitizer --import <dir> --library <dir> [--once|--watch] [options]   (single ad-hoc job)\n\
-options: [--poll-secs N] [--stable-secs N] [--stale-mins N] [--lease-secs N] [--heartbeat-secs N] [--max-reclaims N] [--requeue]\n\
+options: [--poll-secs N] [--stable-secs N] [--stale-mins N] [--lease-secs N] [--heartbeat-secs N] [--max-reclaims N] [--max-attempts N] [--min-extract-ratio R] [--requeue]\n\
 Without --import/--library the config is --config, else sanitizer.json next to the executable.\n\
 --import/--library cannot be combined with --config. Numeric flags override the config values.\n\
 exit codes: 0 ok, 1 usage/fatal error, 2 some zips need review or failed, 3 some job was unavailable";
@@ -26,6 +26,8 @@ struct Args {
     lease: Option<u64>,
     heartbeat: Option<u64>,
     max_reclaims: Option<u64>,
+    max_attempts: Option<u64>,
+    min_extract_ratio: Option<f64>,
     requeue: bool,
 }
 
@@ -52,6 +54,8 @@ fn parse() -> Result<Args, String> {
         lease: None,
         heartbeat: None,
         max_reclaims: None,
+        max_attempts: None,
+        min_extract_ratio: None,
         requeue: false,
     };
     while let Some(arg) = args.next() {
@@ -69,6 +73,16 @@ fn parse() -> Result<Args, String> {
                 a.heartbeat = Some(take_num(&mut args, "--heartbeat-secs")?.max(1))
             }
             "--max-reclaims" => a.max_reclaims = Some(take_num(&mut args, "--max-reclaims")?),
+            "--max-attempts" => {
+                a.max_attempts = Some(take_num(&mut args, "--max-attempts")?.max(1))
+            }
+            "--min-extract-ratio" => {
+                a.min_extract_ratio = Some(
+                    take_value(&mut args, "--min-extract-ratio")?
+                        .parse()
+                        .map_err(|_| "--min-extract-ratio needs a number like 0.95".to_string())?,
+                )
+            }
             "--requeue" => a.requeue = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
@@ -97,6 +111,9 @@ fn build_config(a: &Args) -> Result<SanitizerConfig, String> {
             lease_secs: 300,
             heartbeat_secs: 60,
             max_reclaims: 3,
+            max_attempts: 5,
+            retry_min_age_secs: 600,
+            min_extract_success_ratio: 0.95,
         }
     } else {
         let path = a
@@ -125,6 +142,15 @@ fn build_config(a: &Args) -> Result<SanitizerConfig, String> {
     }
     if let Some(v) = a.max_reclaims {
         cfg.max_reclaims = v as u32;
+    }
+    if let Some(v) = a.max_attempts {
+        cfg.max_attempts = v as u32;
+    }
+    if let Some(v) = a.min_extract_ratio {
+        if !(v > 0.0 && v <= 1.0) {
+            return Err("--min-extract-ratio must be in (0, 1]".into());
+        }
+        cfg.min_extract_success_ratio = v;
     }
     if cfg.heartbeat_secs * 2 > cfg.lease_secs {
         return Err("heartbeat-secs must be at most half of lease-secs".into());

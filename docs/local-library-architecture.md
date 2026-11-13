@@ -76,6 +76,12 @@ functions as the tests. Dependencies: zip, serde(+json), regex, sha2.
 * Order: library zip temp -> rename, sidecar temp -> rename (**commit marker**), then move the original
   to `processed/`. Startup reconcile removes orphan temp files and quarantines sidecar-less zips.
   Temp files live in the destination folder (same filesystem).
+* Retryable errors (truncated/unreadable/missing volume) are counted per item in
+  `processing/<name>.attempts`; after `max_attempts` (5) and `retry_min_age_secs` (600) the set goes to
+  `failed/` with `.review.json` (`RETRIES_EXCEEDED`). Busy/unstable never count.
+* Partial extraction: rar/7z entries that fail are skipped when >= `min_extract_success_ratio` (0.95) of
+  entries are fine; recorded in the sidecar (`skipped_entries`, `extract_success_ratio`) with a WARN log,
+  else `ARCHIVE_CORRUPT` -> `failed/`.
 * Lease/heartbeat claims: the claim file carries owner (host, pid, process start, run id), the volume
   list and a lease expiry (`lease_secs`, default 300) that a heartbeat thread renews every
   `heartbeat_secs` (default 60) during long jobs. Stale claims (lease + skew margin expired, or owner

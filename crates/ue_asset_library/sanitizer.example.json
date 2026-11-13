@@ -15,5 +15,8 @@
   "lease_secs": 300,
   "heartbeat_secs": 60,
   "max_reclaims": 3,
+  "max_attempts": 5,
+  "retry_min_age_secs": 600,
+  "min_extract_success_ratio": 0.95,
   "prefer_engine_versions": ["5.8", "5.7", "5.6"]
 }

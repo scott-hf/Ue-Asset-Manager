@@ -24,6 +24,15 @@ fn default_lease() -> u64 {
 fn default_heartbeat() -> u64 {
     60
 }
+fn default_max_attempts() -> u32 {
+    5
+}
+fn default_retry_min_age() -> u64 {
+    600
+}
+fn default_min_extract_ratio() -> f64 {
+    0.95
+}
 fn default_max_reclaims() -> u32 {
     3
 }
@@ -48,7 +57,7 @@ pub struct JobConfig {
     pub library: PathBuf,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SanitizerConfig {
     pub jobs: Vec<JobConfig>,
@@ -73,6 +82,17 @@ pub struct SanitizerConfig {
     /// After this many reclaims an item moves to `failed/` (`STALE_RETRIES_EXCEEDED`).
     #[serde(default = "default_max_reclaims")]
     pub max_reclaims: u32,
+    /// Attempts for retryable errors (truncated / unreadable / missing volume) before the item
+    /// goes to `failed/` (`RETRIES_EXCEEDED`). Busy and unstable files never count.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// The first attempt must be at least this old before the cap applies (uploads take time).
+    #[serde(default = "default_retry_min_age")]
+    pub retry_min_age_secs: u64,
+    /// Share of archive entries that must extract fine; bad entries are skipped above it
+    /// (recorded in the sidecar), the item fails with `ARCHIVE_CORRUPT` below it.
+    #[serde(default = "default_min_extract_ratio")]
+    pub min_extract_success_ratio: f64,
 }
 
 impl SanitizerConfig {
@@ -130,6 +150,12 @@ impl SanitizerConfig {
         if self.heartbeat_secs == 0 || self.heartbeat_secs * 2 > self.lease_secs {
             return Err("invalid config: \"heartbeat_secs\" must be at least 1 and at most half of \"lease_secs\"".into());
         }
+        if self.max_attempts == 0 {
+            return Err("invalid config: \"max_attempts\" must be at least 1".into());
+        }
+        if !(self.min_extract_success_ratio > 0.0 && self.min_extract_success_ratio <= 1.0) {
+            return Err("invalid config: \"min_extract_success_ratio\" must be in (0, 1]".into());
+        }
         if self.poll_secs == 0 {
             return Err("invalid config: \"poll_secs\" must be at least 1".into());
         }
@@ -149,6 +175,9 @@ impl SanitizerConfig {
                 c.heartbeat_secs = self.heartbeat_secs;
                 c.lease_grace_secs = crate::lease::default_grace(self.lease_secs);
                 c.max_reclaims = self.max_reclaims;
+                c.max_retries = self.max_attempts;
+                c.retry_min_age_secs = self.retry_min_age_secs;
+                c.min_extract_success_ratio = self.min_extract_success_ratio;
                 c.prefer_engine_versions = self.prefer_engine_versions.clone();
                 c
             })
