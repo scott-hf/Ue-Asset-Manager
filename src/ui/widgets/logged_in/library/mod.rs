@@ -1,3 +1,6 @@
+use crate::models::asset_data::{AssetData, AssetType, LocalRef};
+use crate::models::fab_overlay::FabOverlay;
+use crate::models::library_merge::{self, ItemIdentity, MatchKeys};
 use crate::tools::asset_info::Search;
 use crate::ui::widgets::logged_in::refresh::Refresh;
 use asset::EpicAsset;
@@ -6,16 +9,18 @@ use gtk4::{self, prelude::*, CustomSorter};
 use gtk4::{gio, glib, subclass::prelude::*, CompositeTemplate};
 use gtk_macros::action;
 use log::{debug, error, trace, warn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use ue_asset_library::LibraryEntry;
 
 mod actions;
 pub mod asset;
 pub mod asset_detail;
+pub mod filter_bar;
 pub mod image_stack;
 pub mod sidebar;
 
@@ -42,7 +47,9 @@ pub mod imp {
         #[template_child]
         pub asset_search: TemplateChild<gtk4::SearchEntry>,
         #[template_child]
-        pub category_dropdown: TemplateChild<gtk4::DropDown>,
+        pub filter_button: TemplateChild<gtk4::MenuButton>,
+        #[template_child]
+        pub filter_pills: TemplateChild<gtk4::FlowBox>,
         #[template_child]
         pub downloaded_filter: TemplateChild<gtk4::ToggleButton>,
         #[template_child]
@@ -65,9 +72,22 @@ pub mod imp {
         pub grid_model: ListStore,
         pub order_by_ids: RefCell<Vec<String>>,
         pub category_hierarchy: RefCell<BTreeMap<String, BTreeSet<String>>>,
-        pub category_filter_paths: RefCell<Vec<String>>,
+        /// The filter menu and pills (set once in `setup_widgets`).
+        pub filter_bar: OnceCell<std::rc::Rc<filter_bar::FilterBar>>,
+        pub categories_dirty: std::cell::Cell<bool>,
         pub loaded_assets: RefCell<HashMap<String, egs_api::api::types::asset_info::AssetInfo>>,
+        /// Every Epic catalog id (twins included) to its library entry.
         pub loaded_data: RefCell<HashMap<String, crate::models::asset_data::AssetData>>,
+        /// Epic library entries by cleaned name, to find the twin of a new item.
+        pub name_groups: RefCell<HashMap<String, Vec<AssetData>>>,
+        /// Fab listing id to the library entry that has it.
+        pub listing_index: RefCell<HashMap<String, AssetData>>,
+        /// Fab library thumbnails by listing id, for entries whose Epic item has no picture.
+        pub fab_thumbnails: RefCell<HashMap<String, gtk4::gdk::Texture>>,
+        /// Every local library zip, with its identity keys.
+        pub local_entries: RefCell<Vec<(LocalRef, MatchKeys)>>,
+        /// Entries that exist only in the local library, by group key.
+        pub local_only: RefCell<HashMap<String, AssetData>>,
         pub asset_product_names: RefCell<HashMap<String, String>>,
         pub asset_load_pool: ThreadPool,
         pub image_load_pool: ThreadPool,
@@ -92,7 +112,8 @@ pub mod imp {
                 sidebar: OnceCell::new(),
                 asset_grid: TemplateChild::default(),
                 asset_search: TemplateChild::default(),
-                category_dropdown: TemplateChild::default(),
+                filter_button: TemplateChild::default(),
+                filter_pills: TemplateChild::default(),
                 downloaded_filter: TemplateChild::default(),
                 favorites_filter: TemplateChild::default(),
                 select_order_by: TemplateChild::default(),
@@ -115,9 +136,15 @@ pub mod imp {
                 grid_model: gio::ListStore::new::<crate::models::asset_data::AssetData>(),
                 order_by_ids: RefCell::new(Vec::new()),
                 category_hierarchy: RefCell::new(BTreeMap::new()),
-                category_filter_paths: RefCell::new(vec![String::new()]),
+                filter_bar: OnceCell::new(),
+                categories_dirty: std::cell::Cell::new(false),
                 loaded_assets: RefCell::new(HashMap::new()),
                 loaded_data: RefCell::new(HashMap::new()),
+                name_groups: RefCell::new(HashMap::new()),
+                listing_index: RefCell::new(HashMap::new()),
+                fab_thumbnails: RefCell::new(HashMap::new()),
+                local_entries: RefCell::new(Vec::new()),
+                local_only: RefCell::new(HashMap::new()),
                 asset_product_names: RefCell::new(HashMap::new()),
                 asset_load_pool: ThreadPool::with_name("Asset Load Pool".to_string(), 5),
                 image_load_pool: ThreadPool::with_name("Image Load Pool".to_string(), 5),
@@ -406,52 +433,128 @@ impl EpicLibraryBox {
     }
 
     fn handle_asset_action(&self, asset_widget: &EpicAsset, action: &str) {
-        let self_ = self.imp();
-
         debug!("handle_asset_action called with action: {}", action);
 
         // Get the asset data from the widget
-        if let Some(data) = asset_widget.imp().data.borrow().as_ref() {
-            log::info!("Got asset data with id: {}", data.id());
-            let assets = self_.loaded_assets.borrow();
-            if let Some(asset_info) = assets.get(&data.id()) {
-                log::info!("Found asset_info for: {:?}", asset_info.title);
-
-                match action {
-                    "create_project" => {
-                        self.open_create_project_dialog(asset_info);
-                    }
-                    "download" | "add_to_project" => {
-                        // Ask for the project and version before downloading
-                        self.open_download_dialog(asset_info);
-                    }
-                    "show_details" => {
-                        // Open asset details panel
-                        self.show_asset_details(asset_info);
-                    }
-                    _ => {}
-                }
-            } else {
-                log::error!("Asset info not found for id: {}", data.id());
-            }
-        } else {
+        let Some(data) = asset_widget.imp().data.borrow().clone() else {
             log::error!("No asset data in widget!");
+            return;
+        };
+        log::info!("Got asset data with id: {}", data.id());
+        // The entry's Epic item (the one with the thumbnail); entries that exist only in the
+        // local library have none.
+        let asset_info = data.epic_items().into_iter().next();
+
+        match (action, asset_info) {
+            ("create_project", Some(asset_info)) => {
+                self.open_create_project_dialog(&asset_info);
+            }
+            ("download" | "add_to_project" | "create_project", _) => {
+                // A local-only project has no marketplace flow: creating it is done on the
+                // local library page.
+                if !data.has_fab() && data.kind().is_some_and(|k| matches!(k, AssetType::Project)) {
+                    self.show_local_entry(&data);
+                } else {
+                    // Ask for the project, source and version before downloading
+                    self.open_download_dialog(&data);
+                }
+            }
+            ("show_details", Some(asset_info)) => {
+                // Open asset details panel
+                self.show_asset_details(&asset_info);
+            }
+            ("show_details", None) => self.show_local_entry(&data),
+            _ => {}
         }
     }
 
-    /// Ask which project and version to use before downloading an asset.
-    pub fn open_download_dialog(&self, asset_info: &egs_api::api::types::asset_info::AssetInfo) {
+    /// Show a local-only entry on the local library page, where it can be matched, imported or
+    /// turned into a project.
+    fn show_local_entry(&self, data: &AssetData) {
+        let Some(sha) = data
+            .locals()
+            .first()
+            .map(|l| l.entry.sidecar.sha256.clone())
+        else {
+            return;
+        };
+        if let Some(window) = self.imp().window.get() {
+            window.imp().logged_in_stack.show_local_entry(&sha);
+        }
+    }
+
+    /// Ask which project, source (Fab release or local zip) and version to use.
+    pub fn open_download_dialog(&self, data: &AssetData) {
         let self_ = self.imp();
-        debug!("open_download_dialog called for: {:?}", asset_info.title);
+        debug!("open_download_dialog called for: {}", data.name());
 
         match (self_.window.get(), self_.download_manager.get()) {
             (Some(window), Some(dm)) => {
-                crate::ui::widgets::logged_in::download_dialog::EpicDownloadDialog::present_epic(
-                    window, dm, asset_info,
+                crate::ui::widgets::logged_in::download_dialog::EpicDownloadDialog::present_entry(
+                    window, dm, data,
                 );
             }
             _ => warn!("Window or download manager not available for the download dialog"),
         }
+    }
+
+    /// The marketplace items and local zips that belong to one asset, for the download dialog.
+    /// `asset_ids` are Epic catalog ids to look the entry up by; `keys` find it by listing id or
+    /// name when there is no id (the Fab page). Local project zips are not offered.
+    pub fn dialog_parts(
+        &self,
+        asset_ids: &[String],
+        keys: &MatchKeys,
+    ) -> (
+        Vec<egs_api::api::types::asset_info::AssetInfo>,
+        Vec<LibraryEntry>,
+    ) {
+        let self_ = self.imp();
+        let group = {
+            let by_id = self_.loaded_data.borrow();
+            asset_ids
+                .iter()
+                .find_map(|id| by_id.get(id).cloned())
+                .or_else(|| {
+                    let by_listing = self_.listing_index.borrow();
+                    keys.listing_ids
+                        .iter()
+                        .find_map(|l| by_listing.get(l).cloned())
+                })
+                .or_else(|| {
+                    // No listing id on either side: fall back to the cleaned name.
+                    let groups = self_.name_groups.borrow();
+                    keys.name_keys.iter().find_map(|k| {
+                        groups
+                            .get(k)
+                            .and_then(|g| {
+                                g.iter()
+                                    .find(|d| library_merge::matches_local(&d.match_keys(), keys))
+                            })
+                            .cloned()
+                    })
+                })
+        };
+        let (epics, keys) = match &group {
+            Some(g) => {
+                let mut merged = g.match_keys();
+                merged.listing_ids.extend(keys.listing_ids.iter().cloned());
+                merged.name_keys.extend(keys.name_keys.iter().cloned());
+                (g.epic_items(), merged)
+            }
+            None => (Vec::new(), keys.clone()),
+        };
+        let locals = self_
+            .local_entries
+            .borrow()
+            .iter()
+            .filter(|(l, k)| {
+                l.entry.sidecar.kind != ue_asset_library::Kind::Project
+                    && library_merge::matches_local(&keys, k)
+            })
+            .map(|(l, _)| l.entry.clone())
+            .collect();
+        (epics, locals)
     }
 
     fn show_asset_details(&self, asset_info: &egs_api::api::types::asset_info::AssetInfo) {
@@ -615,6 +718,7 @@ impl EpicLibraryBox {
 
     pub fn flush_assets(&self) {
         let self_ = self.imp();
+        self.sync_category_filters();
         if let Ok(mut vec) = self_.assets_pending.write() {
             if vec.is_empty() {
                 return;
@@ -622,6 +726,8 @@ impl EpicLibraryBox {
             self_.grid_model.splice(0, 0, vec.as_slice());
             vec.clear();
         }
+        // New Epic items can be the match of local zips that were shown on their own so far
+        self.reconcile_local();
         self.update_count();
         // Scroll to top if nothing is selected
         let has_asset = self_.details.get().map_or(false, |d| d.has_asset());
@@ -676,9 +782,17 @@ impl EpicLibraryBox {
             self_.select_order_by.set_selected(0);
         }
 
-        let cat_model = gtk4::StringList::new(&["All"]);
-        self_.category_dropdown.set_model(Some(&cat_model));
-        self_.category_dropdown.set_selected(0);
+        // Multi-select filters: "Fab" and "Local" first (both on), then the categories.
+        let bar = filter_bar::FilterBar::new(
+            &self_.filter_button,
+            &self_.filter_pills,
+            clone!(
+                #[weak(rename_to=library)]
+                self,
+                move || library.apply_filter()
+            ),
+        );
+        let _ = self_.filter_bar.set(bar);
 
         if let Some(sidebar) = self_.sidebar.get() {
             sidebar.set_logged_in(self);
@@ -709,14 +823,6 @@ impl EpicLibraryBox {
         ));
 
         self_.favorites_filter.connect_toggled(clone!(
-            #[weak(rename_to=library)]
-            self,
-            move |_| {
-                library.apply_filter();
-            }
-        ));
-
-        self_.category_dropdown.connect_selected_notify(clone!(
             #[weak(rename_to=library)]
             self,
             move |_| {
@@ -824,25 +930,18 @@ impl EpicLibraryBox {
         let filter_p = self.filter();
         let downloaded_only = self_.downloaded_filter.is_active();
         let favorites_only = self_.favorites_filter.is_active();
-
-        let selected_cat = self_.category_dropdown.selected();
-        let category_filter: Option<String> =
-            if selected_cat == 0 || selected_cat == gtk4::INVALID_LIST_POSITION {
-                None
-            } else {
-                self_
-                    .category_filter_paths
-                    .borrow()
-                    .get(selected_cat as usize)
-                    .filter(|p| !p.is_empty())
-                    .cloned()
-            };
+        // Enabled source and category filters (the pills below the search bar)
+        let filters = self_
+            .filter_bar
+            .get()
+            .map(|b| b.filters())
+            .unwrap_or_default();
 
         if filter_p.is_none()
             && search.is_none()
             && !downloaded_only
             && !favorites_only
-            && category_filter.is_none()
+            && filters.is_default()
         {
             self_.filter_model.set_filter(None::<&gtk4::CustomFilter>);
             self.update_count();
@@ -862,15 +961,15 @@ impl EpicLibraryBox {
             let matches_category = filter_p.as_ref().is_none_or(|f| asset.check_category(f));
             let matches_downloaded = !downloaded_only || asset.downloaded();
             let matches_favorites = !favorites_only || asset.favorite();
-            let matches_dropdown = category_filter
-                .as_ref()
-                .is_none_or(|c| asset.check_category(c));
+            let matches_filters = filters.passes(asset.has_fab(), asset.has_local(), &|c| {
+                asset.check_category(c)
+            });
 
             matches_search
                 && matches_category
                 && matches_downloaded
                 && matches_favorites
-                && matches_dropdown
+                && matches_filters
         });
         self_.filter_model.set_filter(Some(&filter));
         self.update_count();
@@ -899,48 +998,20 @@ impl EpicLibraryBox {
         };
 
         if is_new_top || is_new_sub {
-            drop(hierarchy);
-            self.rebuild_category_dropdown();
+            // The menu rows are rebuilt once per flush, not once per new category
+            self_.categories_dirty.set(true);
         }
     }
 
-    fn capitalize(s: &str) -> String {
-        let mut c = s.chars();
-        c.next().map_or_else(String::new, |f| {
-            f.to_uppercase().collect::<String>() + c.as_str()
-        })
-    }
-
-    fn rebuild_category_dropdown(&self) {
+    /// Rebuild the category rows of the filter menu when new categories were found.
+    fn sync_category_filters(&self) {
         let self_ = self.imp();
-        let prev_selected = self_.category_dropdown.selected();
-        let prev_path = self_
-            .category_filter_paths
-            .borrow()
-            .get(prev_selected as usize)
-            .cloned()
-            .unwrap_or_default();
-
-        let hierarchy = self_.category_hierarchy.borrow();
-
-        let model = gtk4::StringList::new(&["All"]);
-        let mut paths = vec![String::new()];
-
-        for (top, subs) in hierarchy.iter() {
-            model.append(&Self::capitalize(top));
-            paths.push(top.clone());
-
-            for sub in subs {
-                model.append(&format!("    {}", Self::capitalize(sub)));
-                paths.push(format!("{}/{}", top, sub));
-            }
+        if !self_.categories_dirty.replace(false) {
+            return;
         }
-
-        let new_selected = paths.iter().position(|p| p == &prev_path).unwrap_or(0) as u32;
-
-        self_.category_filter_paths.replace(paths);
-        self_.category_dropdown.set_model(Some(&model));
-        self_.category_dropdown.set_selected(new_selected);
+        if let Some(bar) = self_.filter_bar.get() {
+            bar.set_categories(&self_.category_hierarchy.borrow());
+        }
     }
 
     pub fn add_asset(
@@ -961,51 +1032,260 @@ impl EpicLibraryBox {
             let win_ = window.imp();
             let sender = win_.model.borrow().sender.clone();
             let _ = sender.send_blocking(crate::ui::messages::Msg::EndAssetProcessing);
-            let mut assets = self_.loaded_assets.borrow_mut();
-            let mut asset_products = self_.asset_product_names.borrow_mut();
-            if match assets.get_mut(&asset.id) {
-                None => {
-                    assets.insert(asset.id.clone(), asset.clone());
-                    if let Some(title) = asset.title.clone() {
-                        let title: String = title
-                            .chars()
-                            .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace())
-                            .collect();
-                        let title: String = title.to_lowercase().replace(' ', "-");
-                        asset_products.insert(title, asset.id.clone());
-                    }
-                    true
+            if self_.loaded_assets.borrow().contains_key(&asset.id) {
+                // TODO: update asset if there are changes
+                trace!("Duplicate asset: {}", asset.id);
+                self.check_refresh();
+                return;
+            }
+            self_
+                .loaded_assets
+                .borrow_mut()
+                .insert(asset.id.clone(), asset.clone());
+            if let Some(title) = asset.title.clone() {
+                let title: String = title
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace())
+                    .collect();
+                let title: String = title.to_lowercase().replace(' ', "-");
+                self_
+                    .asset_product_names
+                    .borrow_mut()
+                    .insert(title, asset.id.clone());
+            }
+
+            // Epic lists a marketplace asset twice when it was migrated to Fab: the legacy item
+            // (with the thumbnail) and its Fab copy (without). They are one entry here.
+            let identity = ItemIdentity::of(asset);
+            let name_key = library_merge::name_key(&identity.title);
+            let twin_of = self_
+                .name_groups
+                .borrow()
+                .get(&name_key)
+                .and_then(|groups| {
+                    groups
+                        .iter()
+                        .find(|g| {
+                            let items: Vec<ItemIdentity> =
+                                g.epic_items().iter().map(ItemIdentity::of).collect();
+                            library_merge::can_join(&items, &identity)
+                        })
+                        .cloned()
+                });
+            let data = if let Some(group) = twin_of {
+                trace!("Merging twin {} into {}", asset.id, group.id());
+                group.add_twin(asset, image);
+                group
+            } else {
+                let data = AssetData::new(asset, image);
+                if !name_key.is_empty() {
+                    self_
+                        .name_groups
+                        .borrow_mut()
+                        .entry(name_key)
+                        .or_default()
+                        .push(data.clone());
                 }
-                Some(a) => {
-                    if asset.id.eq(&a.id) {
-                        // TODO: update asset if there are changes
-                        trace!("Duplicate asset: {}", asset.id);
-                        self.check_refresh();
-                        false
-                    } else {
-                        assets.insert(asset.id.clone(), asset.clone());
-                        if let Some(title) = asset.title.clone() {
-                            let title: String = title
-                                .chars()
-                                .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace())
-                                .collect();
-                            let title: String = title.to_lowercase().replace(' ', "-");
-                            asset_products.insert(title, asset.id.clone());
-                        }
-                        true
-                    }
-                }
-            } {
-                let data = crate::models::asset_data::AssetData::new(asset, image);
-                let mut data_hash = self_.loaded_data.borrow_mut();
                 // IMPORTANT: Insert the SAME object into both loaded_data and grid_model
                 // so that updates to loaded_data are reflected in the GridView
-                data_hash.insert(data.id(), data.clone());
                 if let Ok(mut vec) = self_.assets_pending.write() {
                     vec.push(data.clone().upcast());
                 }
+                data
+            };
+            self_
+                .loaded_data
+                .borrow_mut()
+                .insert(asset.id.clone(), data.clone());
+            if let Some(listing) = identity.listing_id {
+                self_
+                    .listing_index
+                    .borrow_mut()
+                    .insert(listing.clone(), data.clone());
+                if let Some(texture) = self_.fab_thumbnails.borrow().get(&listing) {
+                    data.adopt_thumbnail(texture);
+                }
             }
         }
+    }
+
+    /// Offer the picture of a Fab library asset. Entries whose Epic item has no thumbnail (the Fab
+    /// copy of a migrated asset) show it instead of the generic placeholder.
+    pub fn offer_fab_thumbnail(&self, listing_id: &str, texture: &gtk4::gdk::Texture) {
+        let self_ = self.imp();
+        self_
+            .fab_thumbnails
+            .borrow_mut()
+            .insert(listing_id.to_string(), texture.clone());
+        let data = self_.listing_index.borrow().get(listing_id).cloned();
+        if let Some(data) = data {
+            data.adopt_thumbnail(texture);
+        }
+    }
+
+    /// Replace the set of local library zips (called whenever the local page finished a scan).
+    pub fn set_local_entries(&self, entries: Vec<(LibraryEntry, Option<FabOverlay>)>) {
+        let locals: Vec<(LocalRef, MatchKeys)> = entries
+            .into_iter()
+            .map(|(entry, overlay)| {
+                let local = LocalRef::new(entry, overlay);
+                let keys = local.keys();
+                (local, keys)
+            })
+            .collect();
+        self.imp().local_entries.replace(locals);
+        self.reconcile_local();
+    }
+
+    /// Attach every local zip to the Epic/Fab entry it belongs to (same Fab listing id, else same
+    /// cleaned name) and show the zips that match nothing as entries of their own. Safe to run at
+    /// any time and in any order of arrival: it recomputes the result from both sides.
+    pub fn reconcile_local(&self) {
+        let self_ = self.imp();
+        let locals = self_.local_entries.borrow();
+
+        let mut by_listing: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, (_, keys)) in locals.iter().enumerate() {
+            for l in &keys.listing_ids {
+                by_listing.entry(l.as_str()).or_default().push(i);
+            }
+            for n in &keys.name_keys {
+                by_name.entry(n.as_str()).or_default().push(i);
+            }
+        }
+
+        let mut used = vec![false; locals.len()];
+        let mut changed = false;
+        let groups: Vec<AssetData> = self_
+            .name_groups
+            .borrow()
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        for group in &groups {
+            let keys = group.match_keys();
+            let mut matched: BTreeSet<usize> = BTreeSet::new();
+            let candidates = keys
+                .listing_ids
+                .iter()
+                .filter_map(|l| by_listing.get(l.as_str()))
+                .chain(
+                    keys.name_keys
+                        .iter()
+                        .filter_map(|n| by_name.get(n.as_str())),
+                )
+                .flatten();
+            for &i in candidates {
+                if library_merge::matches_local(&keys, &locals[i].1) {
+                    matched.insert(i);
+                }
+            }
+            for &i in &matched {
+                used[i] = true;
+            }
+            let attached = matched.iter().map(|&i| locals[i].0.clone()).collect();
+            changed |= group.set_locals(attached);
+        }
+
+        // Zips that match no Epic/Fab item: one entry per cleaned name and kind
+        let mut wanted: BTreeMap<String, Vec<LocalRef>> = BTreeMap::new();
+        for (i, (local, _)) in locals.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            let sc = &local.entry.sidecar;
+            let key = format!(
+                "{}:{:?}",
+                library_merge::name_key(&sc.display_name),
+                sc.kind
+            );
+            wanted.entry(key).or_default().push(local.clone());
+        }
+        drop(locals);
+
+        let mut only = self_.local_only.borrow_mut();
+        let gone: Vec<String> = only
+            .keys()
+            .filter(|k| !wanted.contains_key(*k))
+            .cloned()
+            .collect();
+        for key in gone {
+            if let Some(data) = only.remove(&key) {
+                if let Some(pos) = self_.grid_model.find(&data) {
+                    self_.grid_model.remove(pos);
+                }
+                changed = true;
+            }
+        }
+        let mut created: Vec<AssetData> = Vec::new();
+        for (key, refs) in wanted {
+            match only.get(&key) {
+                Some(data) => changed |= data.set_locals(refs),
+                None => {
+                    let data = AssetData::new_local(&key, refs);
+                    only.insert(key, data.clone());
+                    created.push(data);
+                    changed = true;
+                }
+            }
+        }
+        drop(only);
+        for data in &created {
+            self_.grid_model.append(data);
+            self.register_local_only(data);
+        }
+        if changed {
+            self.apply_filter();
+            self.update_count();
+        }
+    }
+
+    /// Fab picture and listing index of a new local-only entry.
+    fn register_local_only(&self, data: &AssetData) {
+        let self_ = self.imp();
+        for listing in data.match_keys().listing_ids {
+            if let Some(texture) = self_.fab_thumbnails.borrow().get(&listing) {
+                data.adopt_thumbnail(texture);
+            }
+            self_
+                .listing_index
+                .borrow_mut()
+                .insert(listing, data.clone());
+        }
+        if data.image().is_some() {
+            return;
+        }
+        // The Fab match stored the listing's picture url; fetch it off the main thread.
+        let url = data
+            .locals()
+            .iter()
+            .find_map(|l| l.overlay.as_ref().and_then(|o| o.thumbnail_url.clone()));
+        let Some(url) = url else {
+            return;
+        };
+        let handle = gio::spawn_blocking(move || {
+            crate::HTTP_CLIENT
+                .get(url)
+                .send()
+                .ok()
+                .and_then(|r| r.bytes().ok())
+                .map(|b| b.to_vec())
+        });
+        glib::spawn_future_local(clone!(
+            #[weak]
+            data,
+            async move {
+                let Ok(Some(bytes)) = handle.await else {
+                    return;
+                };
+                if let Ok(texture) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                {
+                    data.adopt_thumbnail(&texture);
+                }
+            }
+        ));
     }
 
     pub fn start_processing_asset(&self) {
@@ -1299,37 +1579,21 @@ impl EpicLibraryBox {
     }
 
     pub fn set_asset_downloading(&self, id: &str, downloading: bool) {
-        let self_ = self.imp();
-        // Search in grid_model (not loaded_data) because that's what the widgets are bound to
-        for i in 0..self_.grid_model.n_items() {
-            if let Some(obj) = self_.grid_model.item(i) {
-                let data = obj
-                    .downcast_ref::<crate::models::asset_data::AssetData>()
-                    .unwrap();
-                if data.id() == id {
-                    data.set_downloading(downloading);
-                    if !downloading {
-                        data.set_download_progress(0.0);
-                    }
-                    return;
-                }
+        // loaded_data holds the same objects the grid is bound to, under every catalog id of the
+        // entry (a downloaded release can belong to either item of a merged pair).
+        let data = self.imp().loaded_data.borrow().get(id).cloned();
+        if let Some(data) = data {
+            data.set_downloading(downloading);
+            if !downloading {
+                data.set_download_progress(0.0);
             }
         }
     }
 
     pub fn set_asset_download_progress(&self, id: &str, progress: f64, speed: &str) {
-        let self_ = self.imp();
-        // Search in grid_model (not loaded_data) because that's what the widgets are bound to
-        for i in 0..self_.grid_model.n_items() {
-            if let Some(obj) = self_.grid_model.item(i) {
-                let data = obj
-                    .downcast_ref::<crate::models::asset_data::AssetData>()
-                    .unwrap();
-                if data.id() == id {
-                    data.set_download_info(progress, speed);
-                    return;
-                }
-            }
+        let data = self.imp().loaded_data.borrow().get(id).cloned();
+        if let Some(data) = data {
+            data.set_download_info(progress, speed);
         }
     }
 }

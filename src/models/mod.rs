@@ -6,6 +6,8 @@ pub mod fab_cache;
 pub mod fab_data;
 pub mod fab_overlay;
 pub mod fab_search_data;
+pub mod install_log;
+pub mod library_merge;
 pub mod local_library;
 pub mod log_data;
 mod plugin_data;

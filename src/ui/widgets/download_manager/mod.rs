@@ -420,6 +420,14 @@ impl EpicDownloadManager {
         state.download_items.get(id).cloned()
     }
 
+    /// Attach the install-log record of a queued download (`key`: release id for Epic assets,
+    /// asset id for Fab assets). It is written when the download has been put into the project.
+    pub fn set_install_info(&self, key: &str, info: crate::models::install_log::InstallRecord) {
+        if let Some(item) = self.get_item(key) {
+            item.set_install_info(info);
+        }
+    }
+
     fn finish(&self, item: &download_item::EpicDownloadItem) {
         let self_: &imp::EpicDownloadManager = self.imp();
         if let Some(mut child) = self_.downloads.first_child() {

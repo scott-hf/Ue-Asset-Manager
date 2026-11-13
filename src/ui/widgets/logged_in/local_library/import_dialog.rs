@@ -40,6 +40,8 @@ pub mod imp {
         pub entry: RefCell<Option<LibraryEntry>>,
         pub mode: Cell<Option<Mode>>,
         pub selected_project: RefCell<Option<PathBuf>>,
+        /// The `.uproject` file and name of the selected project (for the install log).
+        pub selected_uproject: RefCell<Option<(String, String)>>,
         pub parent_dir: RefCell<Option<PathBuf>>,
         pub preview_serial: Cell<u64>,
         pub busy: Cell<bool>,
@@ -87,6 +89,7 @@ pub mod imp {
                 entry: RefCell::new(None),
                 mode: Cell::new(None),
                 selected_project: RefCell::new(None),
+                selected_uproject: RefCell::new(None),
                 parent_dir: RefCell::new(None),
                 preview_serial: Cell::new(0),
                 busy: Cell::new(false),
@@ -345,11 +348,20 @@ impl EpicLocalImportDialog {
 
     fn on_project_selected(&self, model: &gtk4::SingleSelection) {
         let self_ = self.imp();
-        let root = model
+        let project = model
             .selected_item()
-            .and_downcast::<crate::models::project_data::ProjectData>()
-            .and_then(|p| p.path())
+            .and_downcast::<crate::models::project_data::ProjectData>();
+        let uproject = project.as_ref().and_then(|p| p.path());
+        let root = uproject
+            .as_ref()
             .and_then(|p| PathBuf::from(p).parent().map(std::path::Path::to_path_buf));
+        self_.selected_uproject.replace(uproject.map(|path| {
+            let name = project
+                .as_ref()
+                .and_then(|p| p.name())
+                .unwrap_or_else(|| path.clone());
+            (path, name)
+        }));
         self_.selected_project.replace(root);
         self.update_button();
         self.refresh_preview();
@@ -397,10 +409,24 @@ impl EpicLocalImportDialog {
                 } else {
                     ImportPolicy::SkipExisting
                 };
+                let uproject = self_.selected_uproject.borrow().clone();
                 self.set_busy("Importing...");
                 std::thread::spawn(move || {
                     let result = ue_asset_library::safe_import(&entry, &root, policy)
                         .map(|r| {
+                            // Remember the install (asset, source, engine version, project, time)
+                            if let Some((uproject, project_name)) = &uproject {
+                                crate::models::install_log::record_install(
+                                    crate::models::install_log::InstallRecord::new(
+                                        &entry.sidecar.sha256,
+                                        &entry.sidecar.display_name,
+                                        crate::models::library_merge::Source::Local,
+                                        entry.sidecar.engine_version_guess.as_deref().unwrap_or(""),
+                                        uproject,
+                                        project_name,
+                                    ),
+                                );
+                            }
                             let mut text = format!(
                                 "Imported \"{}\": {} files written, {} skipped, {} backed up.",
                                 entry.sidecar.display_name,

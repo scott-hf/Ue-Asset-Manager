@@ -23,8 +23,10 @@
                     </object>
                 </child>
                 <child>
-                    <object class="GtkDropDown" id="category_dropdown">
-                        <property name="tooltip-text" translatable="yes">Filter by category</property>
+                    <object class="GtkMenuButton" id="filter_button">
+                        <property name="label" translatable="yes">Filters</property>
+                        <property name="always-show-arrow">true</property>
+                        <property name="tooltip-text" translatable="yes">Choose where the assets come from and which categories to show</property>
                     </object>
                 </child>
                 <child>
@@ -64,6 +66,21 @@
                         </child>
                     </object>
                 </child>
+            </object>
+        </child>
+
+        <!-- Enabled filters as removable pills -->
+        <child>
+            <object class="GtkFlowBox" id="filter_pills">
+                <property name="selection-mode">none</property>
+                <property name="homogeneous">false</property>
+                <property name="max-children-per-line">64</property>
+                <property name="column-spacing">6</property>
+                <property name="row-spacing">6</property>
+                <property name="halign">fill</property>
+                <property name="margin-start">16</property>
+                <property name="margin-end">16</property>
+                <property name="margin-bottom">4</property>
             </object>
         </child>
 

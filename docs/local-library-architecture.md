@@ -205,7 +205,7 @@ Accepted: `.rar`, `.7z`, `.7z.001`/`.zip.001` splits, `.partN.rar` and `.rar`+`.
 present and stable; all volumes move together between folders. Identity = sha256 over all volumes. Extraction uses
 the zip hardening rules, then repacks into a normal library zip. RAR entries are extracted to short sequential temp
 names (`f000001`...) because unrar can't create long/non-ASCII paths; the real name is applied in the zip. Entry path
-cap is 400 chars (Windows long paths are enabled on both machines). Names like `(5.0 â€“ 5.8)` / `[5.0-5.3]` are
+cap is 400 chars (Windows long paths are enabled on both machines). Names like `(5.0 – 5.8)` / `[5.0-5.3]` are
 stripped; `engine_version_guess` = lowest, full range in sidecar `extra` (`engine_version_min/max`).
 Encrypted -> needs-review `ENCRYPTED`; corrupt -> `ARCHIVE_CORRUPT`; incomplete RAR set -> retried.
 
@@ -217,6 +217,52 @@ Encrypted -> needs-review `ENCRYPTED`; corrupt -> `ARCHIVE_CORRUPT`; incomplete 
   `prefer_engine_versions` (default `["5.8"]`), else highest version; different base names -> `NESTED_AMBIGUOUS`;
   depth <= 2. Sidecar records `nested_chosen`/`nested_skipped`.
 * Server deploy: `_deploy/install.ps1` copies `*.exe` and `*.dll` (the exe needs `libwinpthread-1.dll`).
+
+### 4.6 Merged Library page, install log and filters
+Code: `src/models/library_merge.rs` (pure rules and tests), `src/models/install_log.rs`, `asset_data.rs` (merged
+item), `library/mod.rs` (`add_asset`, `reconcile_local`, `dialog_parts`), `library/filter_bar.rs`,
+`logged_in/download_dialog.rs`.
+
+**Why every asset appeared twice.** Epic's library returns, for a migrated asset, a legacy `ue` catalog item (with
+images) and a separate Fab-flavoured catalog item with the same title and no images. Measured on a real 2013-item
+cache: 775 such pairs. In 145 pairs the Fab copy has more releases than the legacy item, so releases are unioned,
+never dropped. Developer ids are not reliable enough to guard on. The group "Unreal Engine" (11 legacy items,
+no Fab copy) must never merge.
+
+**Merge rules.**
+* Twin rule: items with the same `name_key` (clean_name, lower case, alphanumerics only) merge when the group has
+  exactly one legacy item and one Fab copy (`can_join`). The item that has a thumbnail becomes the primary one; the
+  other contributes its releases, categories and ids.
+* Local zip to Library entry: a shared Fab listing id (Epic custom attribute `ListingIdentifier`, the Fab URL's last
+  segment, or the `<zip>.fab.json` overlay `listing_uid`) matches. If both sides have listing ids and they share none,
+  they do not match. Without ids a shared `name_key` matches. Local zips with no match show as their own entry
+  (source Local only). Matching is re-run on every change (`reconcile_local`), so the result does not depend on
+  whether the scan or the Epic listing finished first.
+* Thumbnail: the entry uses whichever is populated (Epic image, Fab library image, overlay `thumbnail_url`).
+* Version dropdown: all releases of all sources, each labelled `[Fab]` or `[Local]`, sorted newest engine version
+  first. At the same version Fab sorts before Local (stable sort, `Source::Fab < Source::Local`), and index 0 is the
+  default. The existing `choose_release` rule is then applied on top for a selected project (exact, else the highest
+  not above the project, else the lowest); it keeps the earlier index on a tie, so Fab wins ties. A Local entry
+  needs a project (it is imported with `safe_import`); with "vault only" the button is disabled.
+
+**Install log.** `<user data dir>/epic_asset_manager/install_log.json`, `{"schema":1,"entries":[...]}`; entry =
+asset id, name, source (`fab`|`local`), engine version, project path, project name, RFC 3339 timestamp. Writes are
+read-modify-write under a process lock and replace the file atomically (temp file + rename). A corrupt file or a
+different schema is moved to `install_log.json.bak` and a fresh log is started. Lookup (`latest_for`) matches by any
+known id or by `name_key`, prefers the selected project's newest record, else the newest overall; the dialog shows
+"Installed on MM/DD/YYYY" or "Installed on MM/DD/YYYY in <Project>". Epic/Fab downloads into a project are logged
+as `fab` when extraction has finished and the copy into the project is queued (not after the copy completes);
+local imports are logged as `local` after `safe_import` succeeds, from both the import dialog and the download
+dialog. Downloads to the vault only are not logged.
+
+**Filters.** The category dropdown became a "Filters" popover (`filter_bar.rs`) with check rows; enabled filters show
+as removable pills in a row under the search bar. "Fab" and "Local" are the first two entries, on by default. An entry
+passes when (Fab on and it has a Fab/Epic item) or (Local on and it has a local zip), and every selected category
+matches. Categories combine with AND (each added filter narrows the list; OR would make adding a filter widen it,
+which is surprising next to a search box). Categories of merged twins count; local-only entries map from their kind
+(assets/plugins/projects). Local-only entries show while logged out or offline. The filter state is not persisted:
+the GSettings schema in use can be stale and reading an unknown key panics. The filters apply to the Library page;
+the Fab page keeps its own dropdown and the Local page its search box.
 
 ## 5. Verified vs not verified
 
@@ -232,6 +278,8 @@ Not verified: multi-volume and encrypted RAR (unit tests only), Fab delta cache 
 click-through in the dialog, mouse/visual pass over the new UI, the project picker and "Create new project" flows,
 `--watch` over days / task restart-on-failure, the Linux/Flatpak build after the workspace change,
 offline hiding of the Match button, detail-pane legacy "Add to Project" panel (still the old one).
+Section 4.6 (merge, install log, filters): pure logic is unit tested; the GTK click-through (pills, popover,
+merged tiles, dialog labels, installed line) was not exercised in a display session.
 
 ## 6. Operating notes
 

@@ -1,10 +1,18 @@
-//! One dialog shared by the Epic library and Fab downloads.
+//! One dialog shared by the Epic library, Fab downloads and local library imports.
 //!
 //! It asks which project the asset should be added to (defaulting to the project
-//! selected on the Projects page, or "vault only") and which version to download,
-//! then hands the request to the download manager.
+//! selected on the Projects page, or "vault only") and which version to use, then
+//! hands the request to the download manager (Fab releases) or imports the local
+//! library zip into the project.
+//!
+//! The version list offers every source of the asset: Fab releases and local zips,
+//! each labeled with its source. It is sorted newest engine version first; at the same
+//! version Fab comes before Local and is the default. The project's engine version then
+//! picks the entry (exact match, else the highest not above it, else the lowest).
 
 use crate::models::asset_data::{AssetData, AssetType};
+use crate::models::install_log::{self, InstallRecord};
+use crate::models::library_merge::{self as merge, MatchKeys, Source};
 use crate::models::project_data::ProjectData;
 use crate::models::project_registry::{self as registry, VersionSource};
 use crate::ui::widgets::download_manager::asset::Asset;
@@ -16,9 +24,11 @@ use egs_api::api::types::asset_info::AssetInfo;
 use egs_api::api::types::fab_library::FabAsset;
 use gtk4::glib::clone;
 use gtk4::{self, gio, glib, CompositeTemplate, StringList};
-use log::{debug, warn};
+use log::{debug, error, info, warn};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Mutex;
+use ue_asset_library::{ImportPolicy, Kind, LibraryEntry};
 
 /// Last project choice made in this session (`Some(None)` = vault only).
 static LAST_PROJECT: Mutex<Option<Option<String>>> = Mutex::new(None);
@@ -26,31 +36,101 @@ static LAST_PROJECT: Mutex<Option<Option<String>>> = Mutex::new(None);
 /// (display name, .uproject path, resolved engine version and where it came from)
 type ProjectEntry = (String, String, Option<(String, VersionSource)>);
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum Subject {
-    Epic(AssetInfo),
-    Fab(FabAsset),
+/// Everything that is known about the asset the dialog is opened for: the Epic catalog items
+/// (a legacy item and its Fab copy), the Fab library asset and the local library zips.
+#[derive(Debug, Clone, Default)]
+pub struct Subject {
+    pub title: String,
+    /// Epic catalog items, the one with the thumbnail first.
+    pub epic: Vec<AssetInfo>,
+    pub fab: Option<FabAsset>,
+    /// Local library zips (never of kind `Project`).
+    pub local: Vec<LibraryEntry>,
+    /// Plugins go to `<project>/Plugins/<PluginName>/` only.
+    pub is_plugin: bool,
+    pub show_projects: bool,
+    /// Opened from the Fab page: Fab library releases are listed before the Epic ones.
+    pub fab_first: bool,
 }
 
-/// One selectable version: release id for Epic assets, artifact id for Fab assets.
+impl Subject {
+    fn new(
+        epic: Vec<AssetInfo>,
+        fab: Option<FabAsset>,
+        local: Vec<LibraryEntry>,
+        fab_first: bool,
+    ) -> Self {
+        let local: Vec<LibraryEntry> = local
+            .into_iter()
+            .filter(|e| e.sidecar.kind != Kind::Project)
+            .collect();
+        let title = epic
+            .first()
+            .and_then(|a| a.title.clone())
+            .or_else(|| fab.as_ref().map(|f| f.title.clone()))
+            .or_else(|| local.first().map(|l| l.sidecar.display_name.clone()))
+            .unwrap_or_default();
+        let kinds: Vec<Option<AssetType>> = epic.iter().map(AssetData::decide_kind).collect();
+        let is_plugin = kinds.iter().any(|k| matches!(k, Some(AssetType::Plugin)));
+        let show_projects = fab.is_some()
+            || !local.is_empty()
+            || kinds.iter().any(|k| {
+                matches!(
+                    k,
+                    Some(AssetType::Asset | AssetType::Project | AssetType::Plugin)
+                )
+            });
+        Self {
+            title,
+            epic,
+            fab,
+            local,
+            is_plugin,
+            show_projects,
+            fab_first,
+        }
+    }
+
+    /// Ids and cleaned names under which installs of this asset are logged.
+    fn log_keys(&self) -> (Vec<String>, Vec<String>) {
+        let mut ids: Vec<String> = self.epic.iter().map(|a| a.id.clone()).collect();
+        ids.extend(self.fab.iter().map(|f| f.asset_id.clone()));
+        ids.extend(self.local.iter().map(|l| l.sidecar.sha256.clone()));
+        let mut names: Vec<&str> = vec![self.title.as_str()];
+        names.extend(self.local.iter().map(|l| l.sidecar.display_name.as_str()));
+        (ids, MatchKeys::new(Vec::new(), &names).name_keys)
+    }
+}
+
+/// Where the content of a version entry comes from.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum Origin {
+    /// A release of an Epic catalog item (downloaded from the Epic marketplace).
+    Epic(AssetInfo),
+    /// An artifact of a Fab library asset.
+    Fab(FabAsset),
+    /// A zip of the local library.
+    Local(LibraryEntry),
+}
+
+/// One selectable version: release id (Epic), artifact id (Fab) or sha256 (local zip).
 #[derive(Debug, Clone)]
 pub struct VersionEntry {
-    /// Dropdown text without the project-dependent suffix
+    /// Dropdown text without the project-dependent suffix, starting with the source tag
     pub label: String,
     pub id: String,
     /// Normalized engine versions ("5.3")
     pub engines: Vec<String>,
     platforms: Vec<String>,
+    pub source: Source,
+    pub origin: Origin,
 }
 
 impl VersionEntry {
     /// (major, minor) of every engine version this release supports.
     pub fn tuples(&self) -> Vec<(u32, u32)> {
-        self.engines
-            .iter()
-            .filter_map(|e| registry::version_tuple(e))
-            .collect()
+        merge::engine_tuples(self.engines.iter().map(String::as_str))
     }
 }
 
@@ -81,12 +161,18 @@ pub mod imp {
         pub download_manager: OnceCell<EpicDownloadManager>,
         /// Index 0 is always "vault only" (`None`); the rest are `.uproject` paths.
         pub project_paths: RefCell<Vec<Option<String>>>,
+        /// Display name per project entry (empty for "vault only").
+        pub project_names: RefCell<Vec<String>>,
         /// Normalized engine association per project entry.
         pub project_engines: RefCell<Vec<Option<(String, VersionSource)>>>,
         pub versions: RefCell<Vec<VersionEntry>>,
         pub vault_dirs: RefCell<Vec<String>>,
+        /// The install log as it was when the dialog opened.
+        pub install_records: RefCell<Vec<InstallRecord>>,
         #[template_child]
         pub asset_label: TemplateChild<gtk4::Label>,
+        #[template_child]
+        pub installed_label: TemplateChild<gtk4::Label>,
         #[template_child]
         pub project_box: TemplateChild<gtk4::Box>,
         #[template_child]
@@ -125,10 +211,13 @@ pub mod imp {
                 window: OnceCell::new(),
                 download_manager: OnceCell::new(),
                 project_paths: RefCell::new(Vec::new()),
+                project_names: RefCell::new(Vec::new()),
                 project_engines: RefCell::new(Vec::new()),
                 versions: RefCell::new(Vec::new()),
                 vault_dirs: RefCell::new(Vec::new()),
+                install_records: RefCell::new(Vec::new()),
                 asset_label: TemplateChild::default(),
+                installed_label: TemplateChild::default(),
                 project_box: TemplateChild::default(),
                 project_dropdown: TemplateChild::default(),
                 version_dropdown: TemplateChild::default(),
@@ -171,13 +260,25 @@ glib::wrapper! {
 }
 
 impl EpicDownloadDialog {
-    /// Ask where to put an Epic library asset and which release to download.
+    /// Ask where to put an Epic library asset and which release (or local zip) to use.
     pub fn present_epic(
         window: &EpicAssetManagerWindow,
         dm: &EpicDownloadManager,
         asset: &AssetInfo,
     ) -> Self {
-        let dialog = Self::build(window, dm, Subject::Epic(asset.clone()));
+        let keys = MatchKeys::new(
+            merge::epic_listing_id(asset).into_iter().collect(),
+            &[asset.title.as_deref().unwrap_or_default()],
+        );
+        let logged_in = window.imp().logged_in_stack.clone();
+        let (mut epic, local) = logged_in
+            .imp()
+            .library
+            .dialog_parts(std::slice::from_ref(&asset.id), &keys);
+        if !epic.iter().any(|a| a.id == asset.id) {
+            epic.insert(0, asset.clone());
+        }
+        let dialog = Self::build(window, dm, Subject::new(epic, None, local, false));
         dialog.present_on(window);
         dialog
     }
@@ -188,7 +289,33 @@ impl EpicDownloadDialog {
         dm: &EpicDownloadManager,
         asset: &FabAsset,
     ) -> Self {
-        let dialog = Self::build(window, dm, Subject::Fab(asset.clone()));
+        let keys = MatchKeys::new(
+            merge::fab_listing_id(asset).into_iter().collect(),
+            &[asset.title.as_str()],
+        );
+        let logged_in = window.imp().logged_in_stack.clone();
+        let (epic, local) = logged_in.imp().library.dialog_parts(&[], &keys);
+        let dialog = Self::build(
+            window,
+            dm,
+            Subject::new(epic, Some(asset.clone()), local, true),
+        );
+        dialog.present_on(window);
+        dialog
+    }
+
+    /// Ask for a library entry as shown on the library page (marketplace items and/or zips).
+    pub fn present_entry(
+        window: &EpicAssetManagerWindow,
+        dm: &EpicDownloadManager,
+        data: &AssetData,
+    ) -> Self {
+        let local = data.locals().into_iter().map(|l| l.entry).collect();
+        let dialog = Self::build(
+            window,
+            dm,
+            Subject::new(data.epic_items(), None, local, false),
+        );
         dialog.present_on(window);
         dialog
     }
@@ -203,19 +330,12 @@ impl EpicDownloadDialog {
         let _ = self_.window.set(window.clone());
         let _ = self_.download_manager.set(dm.clone());
 
-        let show_projects = match &subject {
-            Subject::Epic(asset) => matches!(
-                AssetData::decide_kind(asset),
-                Some(AssetType::Asset | AssetType::Project | AssetType::Plugin)
-            ),
-            Subject::Fab(_) => true,
-        };
-        let title = match &subject {
-            Subject::Epic(asset) => asset.title.clone().unwrap_or_default(),
-            Subject::Fab(asset) => asset.title.clone(),
-        };
-        self_.asset_label.set_label(&title);
+        let show_projects = subject.show_projects;
+        self_.asset_label.set_label(&subject.title);
         self_.subject.replace(Some(subject));
+        self_
+            .install_records
+            .replace(install_log::load(&install_log::default_path()));
 
         dialog.setup_versions();
         dialog.setup_vaults();
@@ -251,90 +371,137 @@ impl EpicDownloadDialog {
             self,
             move |_| {
                 dialog.update_platforms();
+                dialog.update_action_state();
             }
         ));
     }
 
-    fn setup_versions(&self) {
-        let self_ = self.imp();
+    /// The version entries of the subject: Fab releases, then local zips, sorted newest engine
+    /// first with Fab before Local at the same version.
+    fn collect_versions(subject: &Subject) -> Vec<VersionEntry> {
         let mut entries: Vec<VersionEntry> = Vec::new();
-        match &*self_.subject.borrow() {
-            Some(Subject::Epic(asset)) => {
-                if let Some(releases) = asset.sorted_releases() {
-                    for release in releases {
-                        let Some(id) = release.app_id.clone() else {
-                            continue;
-                        };
-                        let raw_engines: Vec<String> = release
-                            .compatible_apps
-                            .clone()
-                            .unwrap_or_default()
-                            .iter()
-                            .map(|e| e.trim_start_matches("UE_").to_string())
-                            .collect();
-                        let mut label = release
-                            .version_title
-                            .clone()
-                            .filter(|t| !t.is_empty())
-                            .unwrap_or_else(|| id.clone());
-                        if !raw_engines.is_empty() {
-                            label = format!("{} (UE {})", label, raw_engines.join(", "));
-                        }
-                        entries.push(VersionEntry {
-                            label,
-                            id,
-                            engines: raw_engines
-                                .iter()
-                                .filter_map(|e| normalize_engine(e))
-                                .collect(),
-                            platforms: Vec::new(),
-                        });
-                    }
-                }
-            }
-            Some(Subject::Fab(asset)) => {
-                // Fab lists versions oldest first; show the newest engine first.
-                let engine_key = |pv: &egs_api::api::types::fab_library::ProjectVersion| {
-                    pv.engine_versions
-                        .iter()
-                        .filter_map(|e| normalize_engine(e))
-                        .filter_map(|e| {
-                            let mut it = e.split('.');
-                            Some((
-                                it.next()?.parse::<u32>().ok()?,
-                                it.next()?.parse::<u32>().ok()?,
-                            ))
-                        })
-                        .max()
+        // Release ids are shared by the legacy item, its Fab copy and the Fab library asset
+        let mut seen: HashSet<String> = HashSet::new();
+
+        let push_epic = |entries: &mut Vec<VersionEntry>, seen: &mut HashSet<String>| {
+            for asset in &subject.epic {
+                let Some(releases) = asset.sorted_releases() else {
+                    continue;
                 };
-                let mut sorted: Vec<_> = asset.project_versions.iter().collect();
-                sorted.sort_by_key(|pv| std::cmp::Reverse(engine_key(pv)));
-                for pv in sorted {
-                    let raw_engines: Vec<String> = pv
-                        .engine_versions
+                for release in releases {
+                    let Some(id) = release.app_id.clone() else {
+                        continue;
+                    };
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let raw_engines: Vec<String> = release
+                        .compatible_apps
+                        .clone()
+                        .unwrap_or_default()
                         .iter()
                         .map(|e| e.trim_start_matches("UE_").to_string())
                         .collect();
-                    let label = if raw_engines.is_empty() {
-                        pv.artifact_id.clone()
-                    } else {
-                        format!("UE {}", raw_engines.join(", "))
-                    };
+                    let mut label = release
+                        .version_title
+                        .clone()
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| id.clone());
+                    if !raw_engines.is_empty() {
+                        label = format!("{} (UE {})", label, raw_engines.join(", "));
+                    }
                     entries.push(VersionEntry {
-                        label,
-                        id: pv.artifact_id.clone(),
+                        label: format!("[{}] {label}", Source::Fab.label()),
+                        id,
                         engines: raw_engines
                             .iter()
                             .filter_map(|e| normalize_engine(e))
                             .collect(),
-                        platforms: pv.target_platforms.clone(),
+                        platforms: Vec::new(),
+                        source: Source::Fab,
+                        origin: Origin::Epic(asset.clone()),
                     });
                 }
             }
-            None => {}
+        };
+        let push_fab = |entries: &mut Vec<VersionEntry>, seen: &mut HashSet<String>| {
+            let Some(asset) = &subject.fab else {
+                return;
+            };
+            for pv in &asset.project_versions {
+                if !seen.insert(pv.artifact_id.clone()) {
+                    continue;
+                }
+                let raw_engines: Vec<String> = pv
+                    .engine_versions
+                    .iter()
+                    .map(|e| e.trim_start_matches("UE_").to_string())
+                    .collect();
+                let label = if raw_engines.is_empty() {
+                    pv.artifact_id.clone()
+                } else {
+                    format!("UE {}", raw_engines.join(", "))
+                };
+                entries.push(VersionEntry {
+                    label: format!("[{}] {label}", Source::Fab.label()),
+                    id: pv.artifact_id.clone(),
+                    engines: raw_engines
+                        .iter()
+                        .filter_map(|e| normalize_engine(e))
+                        .collect(),
+                    platforms: pv.target_platforms.clone(),
+                    source: Source::Fab,
+                    origin: Origin::Fab(asset.clone()),
+                });
+            }
+        };
+        if subject.fab_first {
+            push_fab(&mut entries, &mut seen);
+            push_epic(&mut entries, &mut seen);
+        } else {
+            push_epic(&mut entries, &mut seen);
+            push_fab(&mut entries, &mut seen);
         }
 
-        let is_fab = matches!(&*self_.subject.borrow(), Some(Subject::Fab(_)));
+        for entry in &subject.local {
+            let sc = &entry.sidecar;
+            let engines: Vec<String> = sc
+                .engine_version_guess
+                .iter()
+                .filter_map(|e| normalize_engine(e))
+                .collect();
+            let label = match sc.engine_version_guess.as_deref() {
+                Some(engine) => format!(
+                    "[{}] {} (UE {engine})",
+                    Source::Local.label(),
+                    sc.display_name
+                ),
+                None => format!("[{}] {}", Source::Local.label(), sc.display_name),
+            };
+            entries.push(VersionEntry {
+                label,
+                id: sc.sha256.clone(),
+                engines,
+                platforms: Vec::new(),
+                source: Source::Local,
+                origin: Origin::Local(entry.clone()),
+            });
+        }
+
+        merge::sort_versions(&mut entries, |e| (e.tuples().into_iter().max(), e.source));
+        entries
+    }
+
+    fn setup_versions(&self) {
+        let self_ = self.imp();
+        let entries = self
+            .imp()
+            .subject
+            .borrow()
+            .as_ref()
+            .map(Self::collect_versions)
+            .unwrap_or_default();
+
         let has_versions = !entries.is_empty();
         self_.versions.replace(entries);
         self.refresh_version_labels(None, None);
@@ -346,7 +513,6 @@ impl EpicDownloadDialog {
                 .hint_label
                 .set_label("No downloadable version is available.");
         }
-        self_.platform_box.set_visible(is_fab);
         self.update_platforms();
     }
 
@@ -389,21 +555,74 @@ impl EpicDownloadDialog {
         }
     }
 
+    fn selected_version(&self) -> Option<VersionEntry> {
+        let self_ = self.imp();
+        let idx = self_.version_dropdown.selected();
+        if idx == gtk4::INVALID_LIST_POSITION {
+            return None;
+        }
+        self_.versions.borrow().get(idx as usize).cloned()
+    }
+
+    /// The platform list only applies to Fab library releases.
     fn update_platforms(&self) {
         let self_ = self.imp();
-        let idx = self_.version_dropdown.selected() as usize;
-        let platforms = self_
-            .versions
-            .borrow()
-            .get(idx)
-            .map(|v| v.platforms.clone())
+        let platforms = self
+            .selected_version()
+            .filter(|v| matches!(v.origin, Origin::Fab(_)))
+            .map(|v| v.platforms)
             .unwrap_or_default();
+        self_.platform_box.set_visible(!platforms.is_empty());
         let strs: Vec<&str> = platforms.iter().map(String::as_str).collect();
         self_
             .platform_dropdown
             .set_model(Some(&StringList::new(&strs)));
         if let Some(pos) = platforms.iter().position(|p| p == DEFAULT_PLATFORM) {
             self_.platform_dropdown.set_selected(pos as u32);
+        }
+    }
+
+    /// A local zip can only be imported into a project; everything else can go to the vault.
+    fn update_action_state(&self) {
+        let self_ = self.imp();
+        let Some(version) = self.selected_version() else {
+            return;
+        };
+        let has_project = self.selected_project_path().is_some();
+        if has_project {
+            self_.download_button.set_sensitive(true);
+            return;
+        }
+        if matches!(version.origin, Origin::Local(_)) {
+            self_.download_button.set_sensitive(false);
+            self_
+                .hint_label
+                .set_label("A local library zip can only be added to a project: choose a project.");
+        } else {
+            self_.download_button.set_sensitive(true);
+            self_
+                .hint_label
+                .set_label("The asset is downloaded to the vault only.");
+        }
+    }
+
+    /// "Installed on MM/DD/YYYY [in <project>]": the selected project's most recent install when
+    /// there is one, else the most recent install anywhere.
+    fn update_installed_label(&self) {
+        let self_ = self.imp();
+        let Some((ids, names)) = self.imp().subject.borrow().as_ref().map(Subject::log_keys) else {
+            return;
+        };
+        let project = self.selected_project_path();
+        let records = self_.install_records.borrow();
+        match install_log::latest_for(&records, &ids, &names, project.as_deref()) {
+            Some(record) => {
+                self_
+                    .installed_label
+                    .set_label(&install_log::installed_line(record, &chrono::Local));
+                self_.installed_label.set_visible(true);
+            }
+            None => self_.installed_label.set_visible(false),
         }
     }
 
@@ -491,10 +710,12 @@ impl EpicDownloadDialog {
         };
 
         let mut labels = vec!["Don't add to a project (vault only)".to_string()];
+        let mut names = vec![String::new()];
         let mut paths: Vec<Option<String>> = vec![None];
         let mut engines: Vec<Option<(String, VersionSource)>> = vec![None];
         for (name, path, engine) in projects {
-            labels.push(name);
+            labels.push(name.clone());
+            names.push(name);
             paths.push(Some(path));
             engines.push(engine);
         }
@@ -516,6 +737,7 @@ impl EpicDownloadDialog {
         );
 
         self_.project_paths.replace(paths);
+        self_.project_names.replace(names);
         self_.project_engines.replace(engines);
         let strs: Vec<&str> = labels.iter().map(String::as_str).collect();
         self_
@@ -533,7 +755,24 @@ impl EpicDownloadDialog {
         self_.project_paths.borrow().get(idx).cloned().flatten()
     }
 
+    fn selected_project_name(&self) -> String {
+        let self_ = self.imp();
+        let idx = self_.project_dropdown.selected() as usize;
+        self_
+            .project_names
+            .borrow()
+            .get(idx)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn on_project_changed(&self) {
+        self.apply_project_choice();
+        self.update_installed_label();
+        self.update_action_state();
+    }
+
+    fn apply_project_choice(&self) {
         let self_ = self.imp();
         let idx = self_.project_dropdown.selected() as usize;
         let has_project = self.selected_project_path().is_some();
@@ -561,7 +800,8 @@ impl EpicDownloadDialog {
             return;
         };
 
-        // Assets can go up in versions, never down: the highest release not above the project
+        // Assets can go up in versions, never down: the highest release not above the project.
+        // The list is sorted newest first with Fab before Local, so a tie goes to Fab.
         let releases: Vec<Vec<(u32, u32)>> = self_
             .versions
             .borrow()
@@ -605,20 +845,35 @@ impl EpicDownloadDialog {
         });
     }
 
-    /// Start the download with the current choices and close the dialog.
+    /// Start the download (or the local import) with the current choices and close the dialog.
     pub fn confirm(&self) {
         let self_ = self.imp();
         let (Some(window), Some(dm)) = (self_.window.get(), self_.download_manager.get()) else {
             return;
         };
-        let version_idx = self_.version_dropdown.selected() as usize;
-        let Some(version) = self_.versions.borrow().get(version_idx).cloned() else {
+        let Some(version) = self.selected_version() else {
             warn!("Download dialog confirmed without a version");
             return;
         };
         let project_path = self.selected_project_path();
+        let project_name = self.selected_project_name();
         if let Ok(mut last) = LAST_PROJECT.lock() {
             *last = Some(project_path.clone());
+        }
+        let engine_text = version
+            .tuples()
+            .into_iter()
+            .max()
+            .map(|(a, b)| format!("{a}.{b}"))
+            .unwrap_or_default();
+
+        if let Origin::Local(entry) = &version.origin {
+            // A local zip goes straight into the chosen project
+            let Some(uproject) = project_path else {
+                return;
+            };
+            self.import_local(entry.clone(), uproject, project_name, engine_text);
+            return;
         }
 
         let (target, actions) = match &project_path {
@@ -633,11 +888,8 @@ impl EpicDownloadDialog {
                             self_.overwrite_switch.is_active(),
                         )];
                         // Plugins go to <project>/Plugins/<PluginName>/ only
-                        let is_plugin = matches!(
-                            &*self_.subject.borrow(),
-                            Some(Subject::Epic(asset))
-                                if matches!(AssetData::decide_kind(asset), Some(AssetType::Plugin))
-                        );
+                        let is_plugin = matches!(version.origin, Origin::Epic(_))
+                            && self_.subject.borrow().as_ref().is_some_and(|s| s.is_plugin);
                         if is_plugin {
                             actions.push(PostDownloadAction::PluginLayout(Vec::new()));
                         }
@@ -657,16 +909,19 @@ impl EpicDownloadDialog {
             }
         };
 
-        let subject = self_.subject.borrow().clone();
-        match subject {
-            Some(Subject::Epic(asset)) => {
+        // (download manager key, asset id) of what is queued, for the install log
+        let queued: Option<(String, String, String)> = match version.origin.clone() {
+            Origin::Epic(asset) => {
                 debug!(
                     "Download dialog: epic asset {:?} release {} project {:?}",
                     asset.title, version.id, project_path
                 );
-                dm.add_asset_download(version.id, asset, &target, actions);
+                let title = asset.title.clone().unwrap_or_default();
+                let asset_id = asset.id.clone();
+                dm.add_asset_download(version.id.clone(), asset, &target, actions);
+                Some((version.id.clone(), asset_id, title))
             }
-            Some(Subject::Fab(asset)) => {
+            Origin::Fab(asset) => {
                 let platform_idx = self_.platform_dropdown.selected() as usize;
                 let platform = version
                     .platforms
@@ -677,11 +932,109 @@ impl EpicDownloadDialog {
                     "Download dialog: fab asset {} artifact {} platform {} project {:?}",
                     asset.title, version.id, platform, project_path
                 );
-                dm.add_fab_asset_download(asset, version.id, platform, &target, actions);
+                let asset_id = asset.asset_id.clone();
+                let title = asset.title.clone();
+                dm.add_fab_asset_download(asset, version.id.clone(), platform, &target, actions);
+                Some((asset_id.clone(), asset_id, title))
             }
-            None => return,
+            Origin::Local(_) => None,
+        };
+        if let (Some((key, asset_id, title)), Some(uproject)) = (queued, &project_path) {
+            // Written to the install log once the files are in the project
+            dm.set_install_info(
+                &key,
+                InstallRecord::new(
+                    &asset_id,
+                    &title,
+                    Source::Fab,
+                    &engine_text,
+                    uproject,
+                    &project_name,
+                ),
+            );
         }
         window.show_download_manager();
+        self.force_close();
+    }
+
+    /// Import a local library zip into a project (off the main thread) and log the install.
+    fn import_local(
+        &self,
+        entry: LibraryEntry,
+        uproject: String,
+        project_name: String,
+        engine_text: String,
+    ) {
+        let self_ = self.imp();
+        let Some(window) = self_.window.get().cloned() else {
+            return;
+        };
+        let Some(root) = std::path::Path::new(&uproject)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        let policy = if self_.overwrite_switch.is_active() {
+            ImportPolicy::OverwriteWithBackup
+        } else {
+            ImportPolicy::SkipExisting
+        };
+        let record = InstallRecord::new(
+            &entry.sidecar.sha256,
+            &entry.sidecar.display_name,
+            Source::Local,
+            &engine_text,
+            &uproject,
+            &project_name,
+        );
+        debug!(
+            "Download dialog: local zip {} into {}",
+            entry.sidecar.display_name, uproject
+        );
+        window.add_notification(
+            "local-import",
+            &format!("Importing \"{}\"...", entry.sidecar.display_name),
+            gtk4::MessageType::Info,
+        );
+        let handle = gio::spawn_blocking(move || {
+            let result = ue_asset_library::safe_import(&entry, &root, policy)
+                .map(|r| {
+                    let mut text = format!(
+                        "Imported \"{}\": {} files written, {} skipped, {} backed up.",
+                        entry.sidecar.display_name,
+                        r.written.len(),
+                        r.skipped.len(),
+                        r.backed_up.len()
+                    );
+                    for w in &r.warnings {
+                        text.push_str(&format!(" Warning: {w}"));
+                    }
+                    text
+                })
+                .map_err(|e| e.to_string());
+            if result.is_ok() {
+                install_log::record_install(record);
+            }
+            result
+        });
+        glib::spawn_future_local(async move {
+            match handle.await {
+                Ok(Ok(text)) => {
+                    info!("{text}");
+                    window.add_notification("local-import", &text, gtk4::MessageType::Info);
+                }
+                Ok(Err(e)) => {
+                    error!("Local library import failed: {e}");
+                    window.add_notification(
+                        "local-import",
+                        &format!("Import failed: {e}"),
+                        gtk4::MessageType::Error,
+                    );
+                }
+                Err(_) => warn!("The local library import panicked"),
+            }
+        });
         self.force_close();
     }
 }

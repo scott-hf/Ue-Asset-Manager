@@ -321,3 +321,17 @@ windowcontrols button {
   margin: 4px;
   border-radius: 0;
 }
+
+/* Removable filter pills below the search bar of the library */
+.filter-pill {
+  background-color: alpha(currentColor, 0.12);
+  border-radius: 999px;
+  padding: 1px 2px 1px 12px;
+}
+
+.filter-pill button {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 0;
+  margin: 0;
+}

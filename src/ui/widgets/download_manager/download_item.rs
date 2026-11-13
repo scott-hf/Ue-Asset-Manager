@@ -48,6 +48,8 @@ pub mod imp {
         pub total_files: RefCell<u64>,
         pub extracted_files: RefCell<u64>,
         pub post_actions: RefCell<Vec<crate::ui::widgets::download_manager::PostDownloadAction>>,
+        /// Written to the install log when the files of a project install are in place.
+        pub install_info: RefCell<Option<crate::models::install_log::InstallRecord>>,
         pub speed_queue: RefCell<VecDeque<(chrono::DateTime<chrono::Utc>, u128)>>,
         #[allow(dead_code)]
         thumbnail: RefCell<Option<Texture>>,
@@ -86,6 +88,7 @@ pub mod imp {
                 total_files: RefCell::new(0),
                 extracted_files: RefCell::new(0),
                 post_actions: RefCell::new(vec![]),
+                install_info: RefCell::new(None),
                 speed_queue: RefCell::new(VecDeque::new()),
                 thumbnail: RefCell::new(None),
                 pause_button: TemplateChild::default(),
@@ -584,9 +587,34 @@ impl EpicDownloadItem {
                     l_.library.refresh_asset(&id);
                 }
             }
+            self.record_install();
             self.set_property("status", "Finished".to_string());
             self.remove_from_parent_with_timer(5);
         };
+    }
+
+    /// Remember what to write to the install log once this download has been put into a project.
+    pub fn set_install_info(&self, info: crate::models::install_log::InstallRecord) {
+        self.imp().install_info.replace(Some(info));
+    }
+
+    /// Append the install to the install log. Only downloads that copy into a project count; a
+    /// vault-only download is not an install. The copy itself runs asynchronously after the
+    /// extraction, so this marks "extraction finished and copy queued", not a copy confirmation.
+    fn record_install(&self) {
+        let self_ = self.imp();
+        let copies = self_
+            .post_actions
+            .borrow()
+            .iter()
+            .any(|a| matches!(a, PostDownloadAction::Copy(..)));
+        if !copies {
+            return;
+        }
+        let Some(record) = self_.install_info.borrow_mut().take() else {
+            return;
+        };
+        std::thread::spawn(move || crate::models::install_log::record_install(record));
     }
 
     fn remove_from_parent_with_timer(&self, timer: u32) {

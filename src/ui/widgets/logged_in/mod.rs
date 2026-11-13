@@ -170,6 +170,12 @@ impl EpicLoggedInBox {
         self.imp().sidebar.imp().local_library_category.clicked();
     }
 
+    /// Open the local library page with the zip `sha256` selected.
+    pub fn show_local_entry(&self, sha256: &str) {
+        self.open_local_library();
+        self.imp().local_library.select_entry(sha256);
+    }
+
     /// Re-scan the configured project directories (e.g. after creating a project).
     pub fn refresh_projects(&self) {
         self.imp().projects.run_refresh();
@@ -251,6 +257,12 @@ impl EpicLoggedInBox {
         image: Option<gtk4::gdk::Texture>,
     ) {
         let self_ = self.imp();
+        // The library entry of a migrated asset may have no thumbnail of its own
+        if let (Some(texture), Some(listing)) =
+            (&image, crate::models::library_merge::fab_listing_id(asset))
+        {
+            self_.library.offer_fab_thumbnail(&listing, texture);
+        }
         self_.fab.add_fab_asset(asset, image);
     }
 

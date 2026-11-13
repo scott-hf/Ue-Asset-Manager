@@ -1,3 +1,6 @@
+use crate::models::fab_overlay::FabOverlay;
+use crate::models::library_merge::{self, MatchKeys};
+use crate::tools::asset_info::Search;
 use chrono::{DateTime, Utc};
 use diesel::dsl::exists;
 use diesel::{select, ExpressionMethods, QueryDsl, RunQueryDsl};
@@ -8,6 +11,7 @@ use gtk4::prelude::SettingsExtManual;
 use gtk4::{glib, subclass::prelude::*};
 use log::trace;
 use std::path::PathBuf;
+use ue_asset_library::{Kind, LibraryEntry};
 
 pub enum AssetType {
     Asset,
@@ -15,6 +19,53 @@ pub enum AssetType {
     Game,
     Engine,
     Plugin,
+}
+
+/// A local library zip attached to a library entry (with its optional Fab overlay).
+#[derive(Debug, Clone)]
+pub struct LocalRef {
+    pub entry: LibraryEntry,
+    pub overlay: Option<FabOverlay>,
+}
+
+impl LocalRef {
+    pub fn new(entry: LibraryEntry, overlay: Option<FabOverlay>) -> Self {
+        Self { entry, overlay }
+    }
+
+    /// Identity keys used to match this zip against Epic/Fab library items.
+    pub fn keys(&self) -> MatchKeys {
+        let sc = &self.entry.sidecar;
+        let mut names: Vec<&str> = vec![sc.display_name.as_str()];
+        if let Some(friendly) = sc.friendly_name.as_deref() {
+            names.push(friendly);
+        }
+        if let Some(overlay) = &self.overlay {
+            names.push(overlay.title.as_str());
+        }
+        MatchKeys::new(
+            self.overlay.iter().map(|o| o.listing_uid.clone()).collect(),
+            &names,
+        )
+    }
+}
+
+/// Library category path of a local zip, so category filters and the sidebar also work for
+/// entries that exist only locally.
+fn local_category(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Content => "assets",
+        Kind::Plugin => "plugins",
+        Kind::Project => "projects",
+    }
+}
+
+fn local_kind_text(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Content => "asset",
+        Kind::Plugin => "plugins",
+        Kind::Project => "projects",
+    }
 }
 
 // Implementation sub-module of the GObject
@@ -38,6 +89,12 @@ mod imp {
         download_speed: RefCell<String>,
         pub kind: RefCell<Option<String>>,
         pub asset: RefCell<Option<AssetInfo>>,
+        /// The other Epic catalog items of the same asset (the Fab copy of a legacy item).
+        pub twins: RefCell<Vec<AssetInfo>>,
+        /// Local library zips of this asset.
+        pub locals: RefCell<Vec<LocalRef>>,
+        /// Cached identity keys of everything attached to this entry.
+        pub keys: RefCell<MatchKeys>,
         thumbnail: RefCell<Option<Texture>>,
         pub settings: gtk4::gio::Settings,
     }
@@ -60,6 +117,9 @@ mod imp {
                 download_speed: RefCell::new(String::new()),
                 kind: RefCell::new(None),
                 asset: RefCell::new(None),
+                twins: RefCell::new(Vec::new()),
+                locals: RefCell::new(Vec::new()),
+                keys: RefCell::new(MatchKeys::default()),
                 thumbnail: RefCell::new(None),
                 settings: gtk4::gio::Settings::new(crate::config::APP_ID),
             }
@@ -195,11 +255,161 @@ impl AssetData {
         data.check_downloaded();
 
         data.configure_kind(asset);
+        data.refresh_keys();
 
         if let Some(tex) = image {
             data.set_property("thumbnail", tex);
         };
         data
+    }
+
+    /// An entry that exists only in the local library. `group_key` identifies the group of zips
+    /// (cleaned name and kind); the id is `local:<group_key>`.
+    pub fn new_local(group_key: &str, locals: Vec<LocalRef>) -> AssetData {
+        let data: Self = glib::Object::new::<Self>();
+        let self_ = data.imp();
+        data.set_property("id", format!("local:{group_key}"));
+        let first = locals.first().map(|l| l.entry.sidecar.clone());
+        if let Some(sc) = &first {
+            let name = locals
+                .iter()
+                .find_map(|l| l.overlay.as_ref().map(|o| o.title.clone()))
+                .unwrap_or_else(|| sc.display_name.clone());
+            data.set_property("name", name);
+            self_
+                .kind
+                .replace(Some(local_kind_text(sc.kind).to_string()));
+        }
+        self_.locals.replace(locals);
+        data.refresh_keys();
+        data.check_favorite();
+        data.check_downloaded();
+        data
+    }
+
+    /// Whether this entry has Fab (Epic marketplace) content.
+    pub fn has_fab(&self) -> bool {
+        self.imp().asset.borrow().is_some()
+    }
+
+    /// Whether this entry has a local library zip.
+    pub fn has_local(&self) -> bool {
+        !self.imp().locals.borrow().is_empty()
+    }
+
+    /// The Epic catalog items of this entry, the primary one (with the thumbnail) first.
+    pub fn epic_items(&self) -> Vec<AssetInfo> {
+        let self_ = self.imp();
+        let mut items: Vec<AssetInfo> = self_.asset.borrow().iter().cloned().collect();
+        items.extend(self_.twins.borrow().iter().cloned());
+        items
+    }
+
+    /// Ids of every Epic catalog item of this entry.
+    pub fn all_ids(&self) -> Vec<String> {
+        let self_ = self.imp();
+        let mut ids: Vec<String> = self_.asset.borrow().iter().map(|a| a.id.clone()).collect();
+        ids.extend(self_.twins.borrow().iter().map(|a| a.id.clone()));
+        if ids.is_empty() {
+            ids.push(self.id());
+        }
+        ids
+    }
+
+    pub fn locals(&self) -> Vec<LocalRef> {
+        self.imp().locals.borrow().clone()
+    }
+
+    /// Replace the attached local zips. Returns whether anything changed.
+    pub fn set_locals(&self, locals: Vec<LocalRef>) -> bool {
+        let self_ = self.imp();
+        let same = {
+            let old = self_.locals.borrow();
+            old.len() == locals.len()
+                && old
+                    .iter()
+                    .zip(&locals)
+                    .all(|(a, b)| a.entry.zip_path == b.entry.zip_path && a.overlay == b.overlay)
+        };
+        if same {
+            return false;
+        }
+        self_.locals.replace(locals);
+        self.refresh_keys();
+        self.emit_by_name::<()>("refreshed", &[]);
+        true
+    }
+
+    /// Identity keys of everything attached to this entry.
+    pub fn match_keys(&self) -> MatchKeys {
+        self.imp().keys.borrow().clone()
+    }
+
+    fn refresh_keys(&self) {
+        let self_ = self.imp();
+        let mut listing_ids = Vec::new();
+        let mut titles: Vec<String> = Vec::new();
+        for item in self.epic_items() {
+            listing_ids.extend(library_merge::epic_listing_id(&item));
+            titles.extend(item.title.clone());
+        }
+        // The keys of an entry with an Epic/Fab item come from that item only, so the zips that
+        // are attached to it do not influence which zips match it. An entry that exists only in
+        // the local library is identified by its zips.
+        if self_.asset.borrow().is_none() {
+            for local in self_.locals.borrow().iter() {
+                listing_ids.extend(local.keys().listing_ids);
+                titles.push(local.entry.sidecar.display_name.clone());
+            }
+        }
+        let names: Vec<&str> = titles.iter().map(String::as_str).collect();
+        self_.keys.replace(MatchKeys::new(listing_ids, &names));
+    }
+
+    /// Add the second catalog item of the same asset (the Fab copy of a legacy item, or the other
+    /// way round). The item that has a thumbnail becomes the primary one. `image` is the
+    /// already loaded thumbnail of `twin`, if it has one.
+    pub fn add_twin(&self, twin: &AssetInfo, image: Option<Texture>) {
+        let self_ = self.imp();
+        let primary_has_image = self_
+            .asset
+            .borrow()
+            .as_ref()
+            .is_some_and(|a| a.thumbnail().is_some());
+        if twin.thumbnail().is_some() && !primary_has_image {
+            let old = self_.asset.replace(Some(twin.clone()));
+            if let Some(old) = old {
+                self_.twins.borrow_mut().push(old);
+            }
+            self.set_property("id", &twin.id);
+            self.set_property("name", &twin.title);
+            self.configure_kind(twin);
+        } else {
+            self_.twins.borrow_mut().push(twin.clone());
+            if self_.kind.borrow().is_none() {
+                self.configure_kind(twin);
+            }
+        }
+        if self.image().is_none() {
+            if let Some(tex) = image {
+                self.set_property("thumbnail", tex);
+            }
+        }
+        self.refresh_keys();
+        self.check_downloaded();
+        self.check_favorite();
+        self.emit_by_name::<()>("refreshed", &[]);
+    }
+
+    /// Use `texture` as the thumbnail when there is none yet (the Fab library knows the picture of
+    /// items whose Epic catalog entry has none). Returns whether it was applied.
+    pub fn adopt_thumbnail(&self, texture: &Texture) -> bool {
+        if self.image().is_some() {
+            return false;
+        }
+        self.set_property("thumbnail", texture.clone());
+        self.emit_by_name::<()>("refreshed", &[]);
+        true
     }
 
     pub fn decide_kind(asset: &AssetInfo) -> Option<AssetType> {
@@ -270,6 +480,16 @@ impl AssetData {
         self.property("downloaded")
     }
 
+    fn local_date(&self) -> Option<DateTime<Utc>> {
+        self.imp()
+            .locals
+            .borrow()
+            .iter()
+            .filter_map(|l| DateTime::parse_from_rfc3339(&l.entry.sidecar.sanitized_at).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .max()
+    }
+
     pub fn release(&self) -> Option<DateTime<Utc>> {
         let self_ = self.imp();
         (*self_.asset.borrow())
@@ -278,6 +498,7 @@ impl AssetData {
                 None => a.last_modified_date,
                 Some(ri) => ri.date_added,
             })
+            .or_else(|| self.local_date())
     }
 
     pub fn kind(&self) -> Option<AssetType> {
@@ -299,6 +520,7 @@ impl AssetData {
         (*self_.asset.borrow())
             .as_ref()
             .and_then(|a| a.last_modified_date)
+            .or_else(|| self.local_date())
     }
 
     pub fn image(&self) -> Option<Texture> {
@@ -312,18 +534,32 @@ impl AssetData {
             self.downloaded()
         } else {
             let self_ = self.imp();
+            let cat = cat.to_ascii_lowercase();
+            let matches = |info: &AssetInfo| {
+                info.categories.as_ref().is_some_and(|categories| {
+                    categories
+                        .iter()
+                        .any(|c| c.path.to_ascii_lowercase().contains(&cat))
+                })
+            };
             if let Some(b) = self_.asset.borrow().as_ref() {
-                if let Some(categories) = &b.categories {
-                    for category in categories {
-                        if category
-                            .path
-                            .to_ascii_lowercase()
-                            .contains(&cat.to_ascii_lowercase())
-                        {
-                            return true;
-                        }
-                    }
+                if matches(b) {
+                    return true;
                 }
+            }
+            for twin in self_.twins.borrow().iter() {
+                if matches(twin) {
+                    return true;
+                }
+            }
+            // Entries that exist only locally are categorized by the kind of their zip.
+            if self_.asset.borrow().is_none() {
+                let locals = self_.locals.borrow();
+                return locals.iter().any(|l| {
+                    local_category(l.entry.sidecar.kind)
+                        .to_ascii_lowercase()
+                        .contains(&cat)
+                });
             }
             false
         }
@@ -335,10 +571,9 @@ impl AssetData {
 
     pub fn check_downloaded(&self) {
         let self_ = self.imp();
-        let asset = &*self_.asset.borrow();
-        if let Some(ass) = asset {
+        let vaults = self_.settings.strv("unreal-vault-directories");
+        for ass in self.epic_items() {
             if let Some(ris) = &ass.release_info {
-                let vaults = self_.settings.strv("unreal-vault-directories");
                 for ri in ris {
                     if let Some(app) = &ri.app_id {
                         if !Self::downloaded_locations(&vaults, app).is_empty() {
@@ -349,7 +584,11 @@ impl AssetData {
                 }
             }
         }
-        self.set_property("downloaded", false);
+        // A local zip is ready to be added to a project, like a downloaded vault item.
+        self.set_property(
+            "downloaded",
+            self_.asset.borrow().is_none() && !self_.locals.borrow().is_empty(),
+        );
     }
 
     pub fn downloaded_locations(directories: &glib::StrV, asset_id: &str) -> Vec<PathBuf> {
@@ -370,7 +609,7 @@ impl AssetData {
         if let Ok(mut conn) = db.get() {
             let ex: Result<bool, diesel::result::Error> = select(exists(
                 crate::schema::favorite_asset::table
-                    .filter(crate::schema::favorite_asset::asset.eq(self.id())),
+                    .filter(crate::schema::favorite_asset::asset.eq_any(self.all_ids())),
             ))
             .get_result(&mut conn);
             if let Ok(fav) = ex {

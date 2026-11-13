@@ -367,6 +367,17 @@ impl EpicAsset {
         }
     }
 
+    /// Tooltip telling where the entry comes from (Fab, local library or both).
+    fn update_source_tooltip(&self, data: &crate::models::asset_data::AssetData) {
+        let text = match (data.has_fab(), data.has_local()) {
+            (true, true) => Some("Fab, also in the local library"),
+            (true, false) => Some("Fab"),
+            (false, true) => Some("Local library"),
+            (false, false) => None,
+        };
+        self.set_tooltip_text(text);
+    }
+
     pub fn set_data(&self, data: &crate::models::asset_data::AssetData) {
         use crate::models::asset_data::AssetType;
 
@@ -394,6 +405,7 @@ impl EpicAsset {
         };
         self.set_property("kind", kind_str);
         self.set_property("downloaded", data.downloaded());
+        self.update_source_tooltip(data);
 
         self_.handler.replace(Some(data.connect_local(
             "refreshed",
@@ -417,6 +429,12 @@ impl EpicAsset {
                     asset.set_property("downloaded", data.downloaded());
                     asset.set_property("downloading", data.downloading());
                     asset.set_property("download-progress", data.download_progress());
+                    // A thumbnail can arrive later (merged twin, Fab library picture)
+                    let image = data.image();
+                    if image != asset.property::<Option<gtk4::gdk::Texture>>("thumbnail") {
+                        asset.set_property("thumbnail", image);
+                    }
+                    asset.update_source_tooltip(&data);
 
                     // Directly update progress bar and info widgets
                     let self_ = asset.imp();

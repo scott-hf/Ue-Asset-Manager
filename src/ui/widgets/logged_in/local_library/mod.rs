@@ -366,6 +366,7 @@ impl EpicLocalLibraryBox {
         self_.pending.set(dirs.len());
         self.update_detail();
         if dirs.is_empty() {
+            self.publish_entries();
             self.show_empty(
                 "No local library configured",
                 "Add a Local Library directory in the preferences to see sanitized asset zips here.",
@@ -412,6 +413,7 @@ impl EpicLocalLibraryBox {
         }
         self_.pending.set(self_.pending.get().saturating_sub(1));
         if self_.pending.get() == 0 {
+            self.publish_entries();
             self_.refresh_button.set_sensitive(true);
             self.update_count();
             if self_.store.n_items() == 0 {
@@ -429,6 +431,48 @@ impl EpicLocalLibraryBox {
                 }
             } else {
                 self_.content_stack.set_visible_child_name("list");
+            }
+        }
+    }
+
+    /// Hand the scanned zips to the library page, which shows them merged with the Fab entries
+    /// they belong to (or on their own). Works without an Epic login.
+    fn publish_entries(&self) {
+        let self_ = self.imp();
+        let Some(window) = self_.window.get() else {
+            return;
+        };
+        let entries: Vec<_> = (0..self_.store.n_items())
+            .filter_map(|i| self_.store.item(i).and_downcast::<LocalAssetData>())
+            .filter_map(|d| d.entry().map(|e| (e, d.overlay())))
+            .collect();
+        window
+            .imp()
+            .logged_in_stack
+            .imp()
+            .library
+            .set_local_entries(entries);
+    }
+
+    /// Select the entry with this sha256 (used when a local-only tile of the library is opened).
+    pub fn select_entry(&self, sha256: &str) {
+        let self_ = self.imp();
+        // A search can hide the entry: show everything first
+        if !self_.search_entry.text().is_empty() {
+            self_.search_entry.set_text("");
+        }
+        for i in 0..self_.selection.n_items() {
+            if self_
+                .selection
+                .item(i)
+                .and_downcast::<LocalAssetData>()
+                .is_some_and(|d| d.id() == sha256)
+            {
+                self_.selection.set_selected(i);
+                self_
+                    .list_view
+                    .scroll_to(i, gtk4::ListScrollFlags::SELECT, None);
+                return;
             }
         }
     }
@@ -664,6 +708,7 @@ impl EpicLocalLibraryBox {
             data,
             move |overlay| {
                 data.set_overlay(Some(overlay));
+                page.publish_entries();
                 // Only refresh the pane if the same entry is still selected.
                 if page.selected().is_some_and(|s| s == data) {
                     page.update_detail();
@@ -692,6 +737,7 @@ impl EpicLocalLibraryBox {
                 match handle.await {
                     Ok(Ok(())) => {
                         data.set_overlay(None);
+                        page.publish_entries();
                         if page.selected().is_some_and(|s| s == data) {
                             page.update_detail();
                         }
