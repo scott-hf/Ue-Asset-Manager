@@ -8,7 +8,7 @@ use glib::clone;
 use gtk4::{self, prelude::*, CustomSorter};
 use gtk4::{gio, glib, subclass::prelude::*, CompositeTemplate};
 use gtk_macros::action;
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
@@ -1237,6 +1237,12 @@ impl EpicLibraryBox {
             self.register_local_only(data);
         }
         if changed {
+            info!(
+                "Library page: {} local zips ({} shown as local-only entries), {} entries in total",
+                self_.local_entries.borrow().len(),
+                self_.local_only.borrow().len(),
+                self_.grid_model.n_items()
+            );
             self.apply_filter();
             self.update_count();
         }
@@ -1628,5 +1634,75 @@ impl Refresh for EpicLibraryBox {
     }
     fn refresh_state_changed(&self) {
         // No-op in unified view - refresh button always available
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::library_merge::{FilterSet, Source};
+
+    /// Drives the real Library page (GTK needs a desktop session) with the zips of the share and no
+    /// Epic data at all, as when logged out or offline:
+    /// `cargo test --bin epic_asset_manager real_share_zips -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "needs a display and the scott-server share"]
+    fn real_share_zips_are_listed_without_any_epic_data() {
+        gtk4::init().expect("GTK");
+        adw::init().expect("libadwaita");
+        let res =
+            gtk4::gio::Resource::load("data/resources/resources.gresource").expect("gresource");
+        gtk4::gio::resources_register(&res);
+
+        let dir = std::env::var("UE_LIBRARY_TEST_DIR")
+            .unwrap_or_else(|_| "//scott-server/ue_assets_library/library".to_string());
+        let scan = crate::models::local_library::scan_directory(1, std::path::PathBuf::from(dir));
+        let entries = scan.entries.expect("share reachable");
+        let zips = entries.len();
+        assert!(zips >= 3, "only {zips} zips");
+
+        let library = EpicLibraryBox::new();
+        library.set_local_entries(entries);
+
+        let imp = library.imp();
+        let items: Vec<AssetData> = (0..imp.grid_model.n_items())
+            .filter_map(|i| imp.grid_model.item(i).and_downcast::<AssetData>())
+            .collect();
+        let names: Vec<String> = items.iter().map(|a| a.name()).collect();
+        println!("{zips} zips -> {} library entries: {names:?}", items.len());
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|a| a.has_local() && !a.has_fab()));
+        for wanted in [
+            "Advanced Crafting System",
+            "Camping Animations",
+            "Operating Room",
+        ] {
+            assert!(
+                names.iter().any(|n| n.contains(wanted)),
+                "{wanted} missing: {names:?}"
+            );
+        }
+        // the default (both sources on) shows everything, "Local only" too, "Fab only" nothing
+        // `set_window` (not available without an application window) connects the grid to the
+        // filter model; do the same here
+        imp.filter_model.set_model(Some(&imp.grid_model));
+        println!(
+            "grid {} filter_model {}",
+            imp.grid_model.n_items(),
+            imp.filter_model.n_items()
+        );
+        assert_eq!(imp.filter_model.n_items() as usize, items.len());
+        let shown = |filters: &FilterSet| {
+            items
+                .iter()
+                .filter(|a| filters.passes(a.has_fab(), a.has_local(), &|c| a.check_category(c)))
+                .count()
+        };
+        let mut local_only = FilterSet::default();
+        local_only.set_source(Source::Fab, false);
+        assert_eq!(shown(&local_only), items.len());
+        let mut fab_only = FilterSet::default();
+        fab_only.set_source(Source::Local, false);
+        assert_eq!(shown(&fab_only), 0);
     }
 }

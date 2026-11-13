@@ -103,6 +103,30 @@ pub struct ScanResult {
     pub entries: Option<Vec<(LibraryEntry, Option<FabOverlay>)>>,
 }
 
+/// The directory that holds the `*.zip.json` sidecars. The sanitizer share has the layout
+/// `<share>/{import,library,needs-review,...}`; when the configured directory is the share root
+/// (no sidecars of its own, but a `library` folder) the `library` folder is used.
+fn library_dir_of(dir: PathBuf) -> PathBuf {
+    let has_sidecars = std::fs::read_dir(&dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".zip.json")
+        })
+    });
+    let nested = dir.join("library");
+    if !has_sidecars && nested.is_dir() {
+        log::info!(
+            "Local library {} is a share root, scanning {}",
+            dir.display(),
+            nested.display()
+        );
+        return nested;
+    }
+    dir
+}
+
 /// Scan one directory (blocking; call from a worker thread). Never panics on
 /// an unreachable directory, it reports `entries: None` instead.
 pub fn scan_directory(generation: u64, dir: PathBuf) -> ScanResult {
@@ -117,6 +141,7 @@ pub fn scan_directory(generation: u64, dir: PathBuf) -> ScanResult {
             entries: None,
         };
     }
+    let dir = library_dir_of(dir);
     // The Fab overlay is read here (worker thread) so the UI never touches the share.
     let entries = ue_asset_library::scan_library(&dir)
         .into_iter()
@@ -129,5 +154,78 @@ pub fn scan_directory(generation: u64, dir: PathBuf) -> ScanResult {
         generation,
         dir,
         entries: Some(entries),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("eam-locallib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_directory_is_reported_as_unreachable() {
+        let result = scan_directory(1, PathBuf::from("Z:/definitely/not/here"));
+        assert!(result.entries.is_none());
+    }
+
+    #[test]
+    fn share_root_falls_back_to_its_library_folder() {
+        let root = temp_dir("root");
+        std::fs::create_dir_all(root.join("library")).unwrap();
+        std::fs::create_dir_all(root.join("import")).unwrap();
+        assert_eq!(library_dir_of(root.clone()), root.join("library"));
+        // a directory with sidecars of its own is used as it is
+        std::fs::write(root.join("a.zip.json"), "{}").unwrap();
+        assert_eq!(library_dir_of(root.clone()), root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Reads the real share: `cargo test -- --ignored real_share --nocapture`. Override the
+    /// directory with `UE_LIBRARY_TEST_DIR`. Checks the forward-slash, backslash and share-root
+    /// spellings of the path.
+    #[test]
+    #[ignore = "needs the scott-server share"]
+    fn real_share_is_scanned_in_every_path_spelling() {
+        let base = std::env::var("UE_LIBRARY_TEST_DIR")
+            .unwrap_or_else(|_| "//scott-server/ue_assets_library/library".to_string());
+        let forward = base.replace('\\', "/");
+        let back = forward.replace('/', "\\");
+        let root = forward
+            .trim_end_matches('/')
+            .trim_end_matches("/library")
+            .to_string();
+        for spelling in [forward.clone(), back, root] {
+            let result = scan_directory(1, PathBuf::from(&spelling));
+            let entries = result
+                .entries
+                .unwrap_or_else(|| panic!("{spelling} not reachable"));
+            let names: Vec<String> = entries
+                .iter()
+                .map(|(e, _)| {
+                    e.zip_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect();
+            println!("{spelling}: {} entries", names.len());
+            for wanted in [
+                "advanced-crafting-system",
+                "camping-animations",
+                "operating-room-pack",
+            ] {
+                assert!(
+                    names.iter().any(|n| n.starts_with(wanted)),
+                    "{wanted} missing in {spelling}: {names:?}"
+                );
+            }
+        }
     }
 }

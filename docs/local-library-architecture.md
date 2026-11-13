@@ -264,6 +264,21 @@ which is surprising next to a search box). Categories of merged twins count; loc
 the GSettings schema in use can be stale and reading an unknown key panics. The filters apply to the Library page;
 the Fab page keeps its own dropdown and the Local page its search box.
 
+**Configuring the library directory (why "Local only" can show nothing).** The Library page lists local zips
+only for directories in the GSettings key `local-library-directories` (default `[]`, so a fresh install shows no
+local entries and "Fab only" is the only filter that lists anything). On Windows GSettings uses the registry
+backend: values live per user in `HKCU\Software\GSettings\io\github\achetagames\epic_asset_manager` as GVariant
+text, e.g. `['//scott-server/ue_assets_library/library']`. Set it in Preferences (Local Library directories) or
+with `windows/install.ps1 -LibraryDir <dir>` (default `//scott-server/ue_assets_library/library`; written when the
+setting is empty, or always when the parameter is passed explicitly; `-LibraryDir ''` leaves it alone). Forward
+slashes avoid GVariant escaping; backslash and `//host/share` spellings both scan the same files. The directory
+should be the sanitizer's `library` folder; a share root that has a `library` subfolder and no sidecars of its own
+is redirected to it (`library_dir_of`). The host name `scott-server` resolves on the LAN (192.168.12.201 as a
+fallback if name resolution fails). Ignored tests that need the share/display:
+`cargo test --bin epic_asset_manager real_share -- --ignored --nocapture --test-threads=1` (set
+`GSETTINGS_SCHEMA_DIR=<repo>/data/schemas` for the Library page one; it feeds the real zips into
+`EpicLibraryBox::set_local_entries` without any Epic data: 55 zips -> 55 entries).
+
 ## 5. Verified vs not verified
 
 Verified: crate tests (unit, integration, config; two-process claim race), sanitizer on copies of three

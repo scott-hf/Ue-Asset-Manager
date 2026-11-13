@@ -15,12 +15,19 @@
 .PARAMETER Msys        MSYS2 root (default C:\msys64).
 .PARAMETER InstallDir  Install location.
 .PARAMETER Uninstall   Remove the install dir and shortcuts.
+.PARAMETER LibraryDir  Local asset library (the sanitizer's "library" folder, e.g. on a share) to register in
+                       the per-user settings (setting local-library-directories, stored in
+                       HKCU\Software\GSettings\io\github\achetagames\epic_asset_manager). Default:
+                       //scott-server/ue_assets_library/library. Written when the setting is still empty, or
+                       whenever -LibraryDir is passed explicitly (it then replaces the list). Pass '' to leave
+                       the setting alone. Use forward slashes (//host/share/library): no escaping is needed.
 #>
 param(
     [switch]$SkipBuild,
     [switch]$Uninstall,
     [string]$Msys = 'C:\msys64',
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\EpicAssetManager')
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\EpicAssetManager'),
+    [string]$LibraryDir = '//scott-server/ue_assets_library/library'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -120,6 +127,23 @@ if ($LASTEXITCODE) { throw 'glib-compile-schemas failed' }
 foreach ($t in 'Adwaita', 'hicolor') {
     $s = Join-Path $ucrt "share\icons\$t"
     if (Test-Path $s) { Copy-Item $s (Join-Path $InstallDir 'share\icons') -Recurse -Force }
+}
+
+# --- 4b. Register the local library directory (per-user GSettings, registry backend) ---
+# Only this one value is touched. GVariant text for an `as`: ['<path>'] (backslashes would need doubling).
+if ($LibraryDir) {
+    # The settings path is /io/github/achetagames/epic_asset_manager/ whatever the profile (Devel or not)
+    $key = 'HKCU:\Software\GSettings\io\github\achetagames\epic_asset_manager'
+    New-Item -Path $key -Force | Out-Null
+    $current = (Get-ItemProperty -Path $key -Name 'local-library-directories' -ErrorAction SilentlyContinue).'local-library-directories'
+    $empty = (-not $current) -or ($current -match '^\s*(@as\s*)?\[\s*\]\s*$')
+    if ($empty -or $PSBoundParameters.ContainsKey('LibraryDir')) {
+        $value = "['" + ($LibraryDir -replace '\\', '/') + "']"
+        Set-ItemProperty -Path $key -Name 'local-library-directories' -Value $value -Type String
+        Write-Host "Local library directory set to $LibraryDir"
+    } else {
+        Write-Host "Local library directories already configured; left unchanged (pass -LibraryDir to replace)."
+    }
 }
 
 # --- 5. Start Menu shortcut ---
