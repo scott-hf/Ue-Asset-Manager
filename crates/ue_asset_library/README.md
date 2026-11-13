@@ -60,6 +60,34 @@ removed before cleaning.
 | `needs-review/` | Not safe or not unambiguous (multi-root, no `/Game/` match, `..` paths, case collisions, ...). A `<name>.review.json` explains why. |
 | `failed/` | Unreadable or still truncated after 3 attempts, with a `.error.txt`. |
 
+### Stale claims (lease / heartbeat)
+
+`processing/<first volume>.claim` is a small JSON file: host, pid, process start time, run id,
+the volume list and a lease expiry. While a job runs (even an 8 GB extraction) a heartbeat
+thread rewrites it (temp file + rename) every `heartbeat_secs` (default 60), pushing the expiry
+`lease_secs` (default 300) ahead; `heartbeat_secs` must be at most half of `lease_secs`.
+
+On startup and on every `--watch` pass each claim is checked:
+
+* A live owner on the same host (pid running with the same start time) is **never** reclaimed.
+* Otherwise the claim is reclaimed when its lease has expired by more than a clock-skew margin
+  (`max(30, lease_secs/2)` seconds, using the timestamps the owner wrote, not SMB mtimes), or at
+  once when the owner is provably dead (same host, pid gone or reused). Other hosts' claims rely
+  on the lease alone.
+* Takeover is an exclusive-create lock file `processing/<name>.reclaim` (renames are not
+  exclusive on Windows), re-checked after it is acquired, so two sanitizers never both reclaim
+  an item. A lock older than lease + margin belongs to a crashed reclaimer and is taken over.
+  The winner removes stale library `.tmp-*` leftovers (nothing was committed: the sidecar is
+  written last), moves **every** volume back into the import root and counts the reclaim in
+  `processing/<name>.retries`. After `max_reclaims` (default 3) reclaims the set goes to
+  `failed/` with `<name>.error.txt` starting `STALE_RETRIES_EXCEEDED`. Volumes are moved with the
+  first one last, so a reclaim that crashes mid-way is simply resumed by the next pass.
+* Claims written by older versions have no lease. They count as stale after `--stale-mins`
+  (default 120) by file age; they are only reported (`STALE: ...`) unless the owner is provably
+  dead or `--requeue` is given. `--requeue` also requeues unclaimed zips left in `processing/`.
+
+CLI: `--lease-secs`, `--heartbeat-secs`, `--max-reclaims` override the config values.
+
 At startup each job is reconciled after a crash: old `library/.tmp-*` files are removed, a
 library zip without sidecar goes to `needs-review/`, and claims with no zip are dropped.
 A zip stuck in `processing/` longer than `stale_mins` is reported; `--requeue` moves it
@@ -76,6 +104,9 @@ back to the import root.
   "poll_secs": 30,
   "stable_secs": 5,
   "stale_mins": 120,
+  "lease_secs": 300,
+  "heartbeat_secs": 60,
+  "max_reclaims": 3,
   "prefer_engine_versions": ["5.8"]
 }
 ```
@@ -90,6 +121,7 @@ back to the import root.
   `engine_version_guess` is the chosen inner version and the hash/`source_zip` stay the outer
   archive's. Inner archives with different base names -> `needs-review` code `NESTED_AMBIGUOUS`;
   more than 2 nesting levels -> `NESTED_TOO_DEEP`. Entries must be single-file zip/7z/rar.
+* `lease_secs` / `heartbeat_secs` / `max_reclaims`: claim leases, see "Stale claims" below.
 * `poll_secs`, `stable_secs`, `stale_mins` are optional (defaults shown). Unknown keys are
   rejected so typos do not pass silently.
 * Relative paths are resolved against the config file's folder. Use forward slashes or

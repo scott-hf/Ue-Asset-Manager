@@ -12,6 +12,7 @@ pub mod error;
 pub mod harden;
 pub mod import;
 pub mod layout;
+pub mod lease;
 pub mod library;
 pub mod name;
 pub mod nested;

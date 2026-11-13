@@ -10,7 +10,7 @@ use ue_asset_library::config::{
 const USAGE: &str = "usage:\n  \
 ue_asset_sanitizer [--config <sanitizer.json>] [--once|--watch] [options]\n  \
 ue_asset_sanitizer --import <dir> --library <dir> [--once|--watch] [options]   (single ad-hoc job)\n\
-options: [--poll-secs N] [--stable-secs N] [--stale-mins N] [--requeue]\n\
+options: [--poll-secs N] [--stable-secs N] [--stale-mins N] [--lease-secs N] [--heartbeat-secs N] [--max-reclaims N] [--requeue]\n\
 Without --import/--library the config is --config, else sanitizer.json next to the executable.\n\
 --import/--library cannot be combined with --config. Numeric flags override the config values.\n\
 exit codes: 0 ok, 1 usage/fatal error, 2 some zips need review or failed, 3 some job was unavailable";
@@ -23,6 +23,9 @@ struct Args {
     poll: Option<u64>,
     stable: Option<u64>,
     stale: Option<u64>,
+    lease: Option<u64>,
+    heartbeat: Option<u64>,
+    max_reclaims: Option<u64>,
     requeue: bool,
 }
 
@@ -46,6 +49,9 @@ fn parse() -> Result<Args, String> {
         poll: None,
         stable: None,
         stale: None,
+        lease: None,
+        heartbeat: None,
+        max_reclaims: None,
         requeue: false,
     };
     while let Some(arg) = args.next() {
@@ -58,6 +64,11 @@ fn parse() -> Result<Args, String> {
             "--poll-secs" => a.poll = Some(take_num(&mut args, "--poll-secs")?.max(1)),
             "--stable-secs" => a.stable = Some(take_num(&mut args, "--stable-secs")?),
             "--stale-mins" => a.stale = Some(take_num(&mut args, "--stale-mins")?),
+            "--lease-secs" => a.lease = Some(take_num(&mut args, "--lease-secs")?.max(2)),
+            "--heartbeat-secs" => {
+                a.heartbeat = Some(take_num(&mut args, "--heartbeat-secs")?.max(1))
+            }
+            "--max-reclaims" => a.max_reclaims = Some(take_num(&mut args, "--max-reclaims")?),
             "--requeue" => a.requeue = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
@@ -83,6 +94,9 @@ fn build_config(a: &Args) -> Result<SanitizerConfig, String> {
             stable_secs: 5,
             stale_mins: 120,
             prefer_engine_versions: ue_asset_library::config::default_prefer_engine_versions(),
+            lease_secs: 300,
+            heartbeat_secs: 60,
+            max_reclaims: 3,
         }
     } else {
         let path = a
@@ -102,6 +116,18 @@ fn build_config(a: &Args) -> Result<SanitizerConfig, String> {
     }
     if let Some(v) = a.stale {
         cfg.stale_mins = v;
+    }
+    if let Some(v) = a.lease {
+        cfg.lease_secs = v;
+    }
+    if let Some(v) = a.heartbeat {
+        cfg.heartbeat_secs = v;
+    }
+    if let Some(v) = a.max_reclaims {
+        cfg.max_reclaims = v as u32;
+    }
+    if cfg.heartbeat_secs * 2 > cfg.lease_secs {
+        return Err("heartbeat-secs must be at most half of lease-secs".into());
     }
     Ok(cfg)
 }

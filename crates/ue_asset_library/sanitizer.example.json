@@ -12,5 +12,8 @@
   "poll_secs": 30,
   "stable_secs": 5,
   "stale_mins": 120,
+  "lease_secs": 300,
+  "heartbeat_secs": 60,
+  "max_reclaims": 3,
   "prefer_engine_versions": ["5.8", "5.7", "5.6"]
 }

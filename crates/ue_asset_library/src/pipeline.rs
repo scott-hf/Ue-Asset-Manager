@@ -9,8 +9,9 @@ use crate::archive::{
     group_volumes, kind_of_name, sanitize_archive_with, sevenz_expected_len, ArchiveKind,
 };
 use crate::error::{NeedsReview, SanitizeError};
+use crate::lease::{new_body, reclaim_stale, start_heartbeat, LeaseParams};
 use crate::sanitize::{sanitize_zip_with_options, SanitizeOptions, SanitizeOutcome};
-use crate::util::{hostname, is_busy_error, move_unique, rfc3339_utc, unix_secs};
+use crate::util::{is_busy_error, move_unique, rfc3339_utc, unix_secs};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -33,11 +34,27 @@ pub struct Config {
     pub claim_grace_secs: u64,
     /// Attempts for truncated / busy zips before they move to `failed/`.
     pub max_retries: u32,
+    /// A claim is valid this long after its owner's last heartbeat.
+    pub lease_secs: u64,
+    /// The owner refreshes its lease this often.
+    pub heartbeat_secs: u64,
+    /// Clock-skew margin added to the lease expiry before a claim may be reclaimed.
+    pub lease_grace_secs: u64,
+    /// A claim reclaimed more often than this goes to `failed/` (`STALE_RETRIES_EXCEEDED`).
+    pub max_reclaims: u32,
     /// Engine versions preferred when an archive wraps one inner archive per version.
     pub prefer_engine_versions: Vec<String>,
 }
 
 impl Config {
+    pub fn lease_params(&self) -> LeaseParams {
+        LeaseParams {
+            lease_secs: self.lease_secs,
+            heartbeat_secs: self.heartbeat_secs,
+            grace_secs: self.lease_grace_secs,
+        }
+    }
+
     pub fn new(import_dir: impl Into<PathBuf>, library_dir: impl Into<PathBuf>) -> Self {
         Config {
             import_dir: import_dir.into(),
@@ -48,6 +65,10 @@ impl Config {
             tmp_age_secs: 900,
             claim_grace_secs: 300,
             max_retries: 3,
+            lease_secs: 300,
+            heartbeat_secs: 60,
+            lease_grace_secs: crate::lease::default_grace(300),
+            max_reclaims: 3,
             prefer_engine_versions: vec!["5.8".to_string()],
         }
     }
@@ -125,6 +146,11 @@ pub fn try_claim(dirs: &Dirs, src: &Path) -> ClaimResult {
 /// Claim a volume set: the claim file is for the first volume; every volume is renamed
 /// into `processing/` (rolled back when one of them cannot be moved).
 pub fn try_claim_set(dirs: &Dirs, srcs: &[PathBuf]) -> ClaimResult {
+    try_claim_set_with(dirs, srcs, &LeaseParams::default())
+}
+
+/// [`try_claim_set`] with explicit lease timing.
+pub fn try_claim_set_with(dirs: &Dirs, srcs: &[PathBuf], lease: &LeaseParams) -> ClaimResult {
     let Some(src) = srcs.first().map(PathBuf::as_path) else {
         return ClaimResult::Taken;
     };
@@ -156,13 +182,11 @@ pub fn try_claim_set(dirs: &Dirs, srcs: &[PathBuf]) -> ClaimResult {
         }
         Err(e) => return ClaimResult::Busy(e.to_string()),
     };
-    let body = format!(
-        "{{\"host\":{:?},\"pid\":{},\"started\":{:?},\"started_unix\":{}}}",
-        hostname(),
-        std::process::id(),
-        rfc3339_utc(unix_secs()),
-        unix_secs()
-    );
+    let volume_names: Vec<String> = srcs
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    let body = serde_json::to_string(&new_body(volume_names, lease)).unwrap_or_default();
     let _ = f.write_all(body.as_bytes());
     let _ = f.sync_all();
     drop(f);
@@ -268,6 +292,14 @@ pub struct State {
     attempts: HashMap<String, u32>,
 }
 
+/// Final state reached: drop the claim file and the reclaim counter.
+fn release_claim(claim: &Claim) {
+    let _ = fs::remove_file(&claim.claim_path);
+    if let Some(dir) = claim.claim_path.parent() {
+        let _ = fs::remove_file(dir.join(format!("{}.retries", claim.name)));
+    }
+}
+
 fn write_note(dir: &Path, base: &str, suffix: &str, text: &str) {
     let _ = fs::write(dir.join(format!("{base}{suffix}")), text);
 }
@@ -281,6 +313,12 @@ pub fn run_pass(cfg: &Config, state: &mut State, log: &mut dyn FnMut(&str)) -> P
         rep.busy.push(format!("import folders: {e}"));
         return rep;
     }
+    // Reclaim claims of crashed or hung workers (lease expired / owner dead) every pass.
+    let rc = reclaim_stale(cfg, &dirs, false);
+    for a in &rc.actions {
+        log(a);
+    }
+    rep.failed.extend(rc.failed.iter().cloned());
     // Inboxes: the import root itself and the optional unprocessed/ subfolder.
     // Each inbox is grouped on its own: a volume set never spans two folders.
     struct Found {
@@ -450,7 +488,11 @@ fn process_claim(
 ) {
     let name = claim.name.clone();
     let opts = SanitizeOptions::new(cfg.prefer_engine_versions.clone());
-    match run_sanitize(&claim, &cfg.library_dir, &opts) {
+    let heartbeat = start_heartbeat(claim.claim_path.clone(), cfg.lease_params());
+    let outcome = run_sanitize(&claim, &cfg.library_dir, &opts);
+    // Stop beating before any final move so a late beat cannot recreate the claim file.
+    drop(heartbeat);
+    match outcome {
         Ok(SanitizeOutcome::Sanitized {
             library_zip,
             sidecar,
@@ -482,7 +524,7 @@ fn process_claim(
             } else {
                 log(&format!("{name}: could not move duplicate to processed"));
             }
-            let _ = fs::remove_file(&claim.claim_path);
+            release_claim(&claim);
             rep.duplicates.push(name);
         }
         Err(SanitizeError::NeedsReview(nr)) => {
@@ -539,7 +581,7 @@ fn finish_move(
 ) {
     match move_claim_files(claim, dest) {
         Ok(_) => {
-            let _ = fs::remove_file(&claim.claim_path);
+            release_claim(claim);
         }
         Err(e) => {
             log(&format!(
@@ -569,7 +611,7 @@ fn send_to_review(dirs: &Dirs, claim: &Claim, nr: &NeedsReview) {
         dirs.needs_review.join(format!("{base}.review.json")),
         serde_json::to_vec_pretty(&json).unwrap_or_default(),
     );
-    let _ = fs::remove_file(&claim.claim_path);
+    release_claim(claim);
 }
 
 fn send_to_failed(dirs: &Dirs, claim: &Claim, why: &str) {
@@ -580,7 +622,7 @@ fn send_to_failed(dirs: &Dirs, claim: &Claim, why: &str) {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| claim.name.clone());
     write_note(&dirs.failed, &base, ".error.txt", &format!("{why}\n"));
-    let _ = fs::remove_file(&claim.claim_path);
+    release_claim(claim);
 }
 
 /// One-shot: reconcile is the caller's job; this scans, waits one stability
@@ -601,7 +643,7 @@ pub fn run_once(cfg: &Config, log: &mut dyn FnMut(&str)) -> PassReport {
 }
 
 /// Other volumes of the archive whose first volume is `first`, found next to it in `dir`.
-fn siblings_in(dir: &Path, first: &str) -> Vec<String> {
+pub(crate) fn siblings_in(dir: &Path, first: &str) -> Vec<String> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -684,42 +726,17 @@ pub fn reconcile(cfg: &Config) -> Vec<String> {
         }
     }
 
-    // Claims and processing leftovers.
+    // Claims and processing leftovers: stale claims (expired lease, dead owner, legacy) first.
+    let rc = reclaim_stale(cfg, &dirs, true);
+    actions.extend(rc.actions);
     let stale_secs = cfg.stale_mins * 60;
     let mut claimed_names: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(&dirs.processing) {
         let entries: Vec<_> = rd.flatten().collect();
         for e in &entries {
             let name = e.file_name().to_string_lossy().to_string();
-            let Some(zip_name) = name.strip_suffix(".claim") else {
-                continue;
-            };
-            claimed_names.push(zip_name.to_string());
-            let claim_path = e.path();
-            let age = age_secs(&claim_path).unwrap_or(0);
-            let zip_here = dirs.processing.join(zip_name);
-            if !zip_here.exists() {
-                if age >= cfg.claim_grace_secs && fs::remove_file(&claim_path).is_ok() {
-                    actions.push(format!("removed claim without a zip: {name}"));
-                }
-            } else if age >= stale_secs {
-                if cfg.requeue {
-                    match move_unique(&zip_here, &dirs.root, zip_name) {
-                        Ok(_) => {
-                            for sib in siblings_in(&dirs.processing, zip_name) {
-                                let _ = move_unique(&dirs.processing.join(&sib), &dirs.root, &sib);
-                            }
-                            let _ = fs::remove_file(&claim_path);
-                            actions.push(format!("stale claim requeued: {zip_name}"));
-                        }
-                        Err(e) => actions.push(format!("could not requeue {zip_name}: {e}")),
-                    }
-                } else {
-                    actions.push(format!(
-                        "STALE: {zip_name} has been in processing/ for {} min (use --requeue to put it back)",
-                        age / 60
-                    ));
-                }
+            if let Some(z) = name.strip_suffix(".claim") {
+                claimed_names.push(z.to_string());
             }
         }
         for e in &entries {

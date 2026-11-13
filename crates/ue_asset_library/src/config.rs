@@ -18,6 +18,16 @@ pub fn default_prefer_engine_versions() -> Vec<String> {
     vec!["5.8".to_string()]
 }
 
+fn default_lease() -> u64 {
+    300
+}
+fn default_heartbeat() -> u64 {
+    60
+}
+fn default_max_reclaims() -> u32 {
+    3
+}
+
 fn default_poll() -> u64 {
     30
 }
@@ -52,6 +62,17 @@ pub struct SanitizerConfig {
     /// (order = priority; when none matches, the highest version found is used).
     #[serde(default = "default_prefer_engine_versions")]
     pub prefer_engine_versions: Vec<String>,
+    /// A claim is valid this long after the owning worker's last heartbeat; after that (plus a
+    /// clock-skew margin) any sanitizer may reclaim it. `stale_mins` now only governs legacy
+    /// claims written without a lease.
+    #[serde(default = "default_lease")]
+    pub lease_secs: u64,
+    /// How often the owner refreshes its lease (must be at most half of `lease_secs`).
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_secs: u64,
+    /// After this many reclaims an item moves to `failed/` (`STALE_RETRIES_EXCEEDED`).
+    #[serde(default = "default_max_reclaims")]
+    pub max_reclaims: u32,
 }
 
 impl SanitizerConfig {
@@ -106,6 +127,9 @@ impl SanitizerConfig {
                 ));
             }
         }
+        if self.heartbeat_secs == 0 || self.heartbeat_secs * 2 > self.lease_secs {
+            return Err("invalid config: \"heartbeat_secs\" must be at least 1 and at most half of \"lease_secs\"".into());
+        }
         if self.poll_secs == 0 {
             return Err("invalid config: \"poll_secs\" must be at least 1".into());
         }
@@ -121,6 +145,10 @@ impl SanitizerConfig {
                 c.stable_secs = self.stable_secs;
                 c.stale_mins = self.stale_mins;
                 c.requeue = requeue;
+                c.lease_secs = self.lease_secs;
+                c.heartbeat_secs = self.heartbeat_secs;
+                c.lease_grace_secs = crate::lease::default_grace(self.lease_secs);
+                c.max_reclaims = self.max_reclaims;
                 c.prefer_engine_versions = self.prefer_engine_versions.clone();
                 c
             })

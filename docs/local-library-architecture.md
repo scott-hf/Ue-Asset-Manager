@@ -76,7 +76,13 @@ functions as the tests. Dependencies: zip, serde(+json), regex, sha2.
 * Order: library zip temp -> rename, sidecar temp -> rename (**commit marker**), then move the original
   to `processed/`. Startup reconcile removes orphan temp files and quarantines sidecar-less zips.
   Temp files live in the destination folder (same filesystem).
-* No lease/heartbeat: stale claims are reported, `--requeue` returns them to the inbox.
+* Lease/heartbeat claims: the claim file carries owner (host, pid, process start, run id), the volume
+  list and a lease expiry (`lease_secs`, default 300) that a heartbeat thread renews every
+  `heartbeat_secs` (default 60) during long jobs. Stale claims (lease + skew margin expired, or owner
+  provably dead on the same host; a live same-host owner is never reclaimed) are reclaimed automatically
+  at startup and on every watch pass: exclusive `create_new` lock, partial `.tmp-*` outputs removed, all
+  volumes back to the inbox. After `max_reclaims` (default 3) the set goes to `failed/` with
+  `STALE_RETRIES_EXCEEDED`. Legacy lease-less claims still use `stale_mins`/`--requeue`.
 
 #### Safe import
 
