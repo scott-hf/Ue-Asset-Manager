@@ -198,7 +198,8 @@ Fab plugin releases are laid out as `Engine/Plugins/Marketplace/<ReleaseId>/...`
 plugin_layout.rs` maps that (and `Engine/Plugins/<X>/`, `Plugins/<X>/`) to `<project>/Plugins/<PluginName>/`,
 name taken from the `.uplugin` stem; ambiguous layouts abort. Plugins always download to the vault first.
 End-to-end: "UI Effect Function Library" (5.8 release) -> `PrjEfz/Plugins/ExtendBlueprintNode/`, 20 files,
-nothing else in the project touched, no Perforce commands (files are new/unopened in P4).
+nothing else in the project touched, no version-control commands (the files are simply new in the
+working tree; staging them is the user's or an agent's `vcs_*` step).
 
 ### 4.3 Fab library cache
 `src/models/fab_cache.rs`: versioned `index.json`, atomic writes, corrupt cache ignored. Startup shows
@@ -284,6 +285,58 @@ fallback if name resolution fails). Ignored tests that need the share/display:
 `cargo test --bin epic_asset_manager real_share -- --ignored --nocapture --test-threads=1` (set
 `GSETTINGS_SCHEMA_DIR=<repo>/data/schemas` for the Library page one; it feeds the real zips into
 `EpicLibraryBox::set_local_entries` without any Epic data: 55 zips -> 55 entries).
+
+### 4.7 Selective import
+Design: `docs/selective-import-design.md`. Crate side (`ue_asset_library`): modules `uasset`, `asset_index`, and
+`import::{preview_import_subset, safe_import_subset}`.
+* **`uasset`**: bounds-checked reader for the editor package header (ported from the idea of Hoard's `hoard-unreal`
+  reader, MIT-0, no hoard dependency). Reads the summary (legacy/UE4/UE5 versions, custom versions, `TotalHeaderSize`),
+  name, import and export tables, soft package references, soft object paths and the thumbnail table; returns the main
+  export's class short name and PNG/JPEG thumbnail bytes. Garbage or truncated input returns `ParseError`, never panics
+  (every count is checked against the remaining bytes). Cooked packages parse names/imports, no thumbnail; unversioned
+  cooked packages are unreadable. `uasset::synth` is a `doc(hidden)` synthetic package writer used by the tests.
+* **`asset_index`**: `build_index` streams the zip, groups `.uasset`/`.umap` with their `.uexp/.ubulk/.m.ubulk/.uptnl`
+  companions by stem, reads at most `TotalHeaderSize` bytes per package (16 MiB cap; larger or unparsable ->
+  `header_unreadable`), and resolves dependencies (imports excluding `/Script/` and `/Engine/`, soft package refs, and
+  name-table strings that look like `/Game/...` paths) to in-pack packages (`Content/X` <-> `/Game/X`, since the sanitizer
+  already applied the rewrite); the rest are `external` (name-table strings only count when under `/Game/`).
+  Content and project packs are indexed (project: only the `Content/` tree; `Config/`, `Source/`, `Plugins/` ignored);
+  plugin packs return `WrongKind(Plugin)`. `load_or_build_index` uses the overlay `<zip>.assets.json` when its
+  `sidecar_sha256`, `entry_count` and `schema` match, else rebuilds and writes it atomically (temp + rename; a write
+  failure, e.g. read-only share, is ignored). `closure` is the transitive dependency set (cycles fine, unknown paths
+  dropped). `read_thumbnail` extracts one thumbnail lazily from the zip.
+* **Sanitizer**: after the sidecar commit and after the claim is released, `run_pass` builds and writes the overlay for
+  content/project entries; a failure only logs `WARN: ... asset index not written`.
+* **Subset import**: `Selection { game_paths, include_deps }`. The whole zip is still validated (hardening, counts and
+  sizes vs the sidecar); only the selected packages' files (+ companions, + closure when `include_deps`) are extracted and
+  applied, with the same conflict/backup/skip behaviour as `safe_import`. `EmptySelection`, `UnknownPackage(path)` and a
+  stale index (`SidecarMismatch`) are rejected before anything is written. Project packs write only under the target
+  project's `Content/` (never the `.uproject`, `Config/`, `Source/`); full-pack `safe_import` of a project stays
+  `WrongKind`. `ImportReport.external_missing` lists the external packages of what was imported (plus a warning).
+* Tests: `uasset` unit tests (versions 4.27/5.3/5.5/5.6 layouts, cooked, corruption fuzz), `asset_index` unit tests,
+  `tests/selective.rs` (index, closure, overlay staleness, thumbnails, subset import policies/errors, project and plugin
+  packs, pipeline overlay) and the ignored `real_library_index_stats` (`UE_ASSET_REAL_LIBRARY=<library dir>`).
+* **Unreadable headers, engine range and the zip64 bug (follow-up)**: `PackageInfo.unreadable_reason` (`zip_entry`,
+  `header_too_large`, `unversioned`, `bad_magic`, `bad_header`) and `AssetIndex.engine_version_min/max` (`major.minor`
+  over the saved-by engine version of the readable headers) are additive (`serde(default)`; old overlays load).
+  Real cause of the 505 unreadable packages in the megapack (verified by parsing its central directory): the zip crate
+  (8.1) writes a malformed record for a raw-copied entry whose local header lies beyond 4 GiB: offset field
+  `0xFFFFFFFF` and the zip64 extra block twice, `[usize, csize, offset]` (correct) then `[0, 0, offset]`. Those are
+  the LAST 507 of 2063 entries (offsets 4.0 to 8.4 GiB); the zip crate reader lets the last block win, so they read as
+  size 0 and fail the CRC (whole-zip `validate` also failed: 4.3 GB of 8.8 GB). The trigger is the offset, not the
+  entry size and not a zip64 extra in the source (a probe with a small deflated source reproduces it).
+  Writer: `write_zip` re-writes entries that start beyond 4 GiB through the normal decompress/compress path
+  (`RAW_COPY_LIMIT`) and verifies every central record's size after writing (`tests/big_zip.rs`, ignored, ~4.4 GiB).
+  Reader: `zipfix::Repairs` re-parses the central directory, finds records with duplicated zip64 blocks and opens each
+  through a virtual one-entry zip (original local header + data, then a corrected central directory), so the zip
+  crate still decompresses and CRC-checks. `validate`, `build_index`, `read_thumbnail` and every extraction use it, so
+  existing library zips work without re-sanitizing (nothing is written; entries with a compressed size of 4 GiB or
+  more are not supported by the repair view). Test: a synthetic zip with the duplicated-block pattern
+  (`zips_with_duplicated_zip64_blocks_are_read_through_the_repair_view`). Real megapack, read-only: 2056 packages,
+  0 unreadable, engine 4.26..5.0, `preview_import_subset` of 3 textures and an extraction of a formerly broken 31 MB
+  entry byte-exact.
+* Known gaps: packages renamed after cooking are matched by the stem minus `_<digits>` only; dependencies on engine
+  plugin mounts other than `/Script/` and `/Engine/` appear as `external`; `.umap` sub-levels are one unit.
 
 ## 5. Verified vs not verified
 

@@ -126,6 +126,10 @@ pub enum ImportError {
     InvalidName(String),
     TargetExists(PathBuf),
     PathConflict(String),
+    /// Selective import with nothing selected.
+    EmptySelection,
+    /// Selective import names a package that is not in the pack index.
+    UnknownPackage(String),
 }
 
 impl fmt::Display for ImportError {
@@ -144,6 +148,8 @@ impl fmt::Display for ImportError {
             ImportError::InvalidName(s) => write!(f, "invalid project name: {s}"),
             ImportError::TargetExists(p) => write!(f, "target already exists: {}", p.display()),
             ImportError::PathConflict(s) => write!(f, "file/folder type conflict: {s}"),
+            ImportError::EmptySelection => write!(f, "no assets selected"),
+            ImportError::UnknownPackage(s) => write!(f, "package not in this pack: {s}"),
         }
     }
 }

@@ -6,9 +6,11 @@ use crate::layout::{plan_layout, Layout};
 use crate::name::clean_name_ranged;
 use crate::sidecar::{Kind, Sidecar, SCHEMA_VERSION};
 use crate::util::{is_busy_error, rfc3339_utc, sha256_file, slugify, unique_token, unix_secs};
+use std::cell::Cell;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use zip::result::ZipError;
 use zip::{ZipArchive, ZipWriter};
 
@@ -126,30 +128,92 @@ fn find_duplicate(library_dir: &Path, sha12: &str) -> Option<PathBuf> {
     None
 }
 
+/// Entries that would start at or beyond this offset are not raw-copied: the zip crate writes a
+/// malformed zip64 central record for a raw-copied entry whose local header lies past 4 GiB
+/// (size 0 / duplicated zip64 block), which made such entries unreadable. They are re-written
+/// through the normal (decompress + compress) path instead.
+const RAW_COPY_LIMIT: u64 = 0xFFFF_FFFF - (1 << 20);
+
+/// Tracks the current stream position of the zip output.
+struct PosWriter<W> {
+    inner: W,
+    at: Rc<Cell<u64>>,
+}
+
+impl<W: Write> Write for PosWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.at.set(self.at.get() + n as u64);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for PosWriter<W> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let p = self.inner.seek(pos)?;
+        self.at.set(p);
+        Ok(p)
+    }
+}
+
 fn write_zip(src: &Path, layout: &Layout, tmp: &Path) -> Result<(), SanitizeError> {
     let mut archive = ZipArchive::new(BufReader::with_capacity(1 << 20, File::open(src)?))
         .map_err(map_open_error)?;
-    let out = BufWriter::with_capacity(1 << 20, File::create(tmp)?);
+    let at = Rc::new(Cell::new(0u64));
+    let out = PosWriter {
+        inner: BufWriter::with_capacity(1 << 20, File::create(tmp)?),
+        at: at.clone(),
+    };
     let mut writer = ZipWriter::new(out);
+    let mut expected: Vec<u64> = Vec::with_capacity(layout.renames.len());
     for r in &layout.renames {
+        let pos = at.get();
+        if pos >= RAW_COPY_LIMIT {
+            let mut f = archive
+                .by_index(r.index)
+                .map_err(|e| SanitizeError::Corrupt(format!("{}: {e}", r.from)))?;
+            let method = if f.compression() == zip::CompressionMethod::Stored {
+                zip::CompressionMethod::Stored
+            } else {
+                zip::CompressionMethod::Deflated
+            };
+            let size = f.size();
+            let opts = f
+                .options()
+                .compression_method(method)
+                .large_file(size > (3u64 << 30));
+            writer
+                .start_file(r.to.clone(), opts)
+                .map_err(|e| SanitizeError::Io(format!("{}: {e}", r.to)))?;
+            std::io::copy(&mut f, &mut writer)
+                .map_err(|e| SanitizeError::Io(format!("{}: {e}", r.from)))?;
+            expected.push(size);
+            continue;
+        }
         let f = archive
             .by_index_raw(r.index)
             .map_err(|e| SanitizeError::Corrupt(format!("{}: {e}", r.from)))?;
+        expected.push(f.size());
         writer
             .raw_copy_file_rename(f, &r.to)
             .map_err(|e| SanitizeError::Io(format!("{}: {e}", r.to)))?;
     }
     let mut out = writer
         .finish()
-        .map_err(|e| SanitizeError::Io(e.to_string()))?;
+        .map_err(|e| SanitizeError::Io(e.to_string()))?
+        .inner;
     out.flush()?;
     let file = out
         .into_inner()
         .map_err(|e| SanitizeError::Io(e.to_string()))?;
     file.sync_all()?;
     drop(file);
-    // Integrity check: the finished zip must reopen with the expected entry count.
-    let check = ZipArchive::new(BufReader::new(File::open(tmp)?))
+    // Integrity check: the finished zip must reopen with the expected entry count, and every
+    // central record must carry the size of its source entry.
+    let mut check = ZipArchive::new(BufReader::new(File::open(tmp)?))
         .map_err(|e| SanitizeError::Io(format!("verify: {e}")))?;
     if check.len() != layout.renames.len() {
         return Err(SanitizeError::Io(format!(
@@ -157,6 +221,19 @@ fn write_zip(src: &Path, layout: &Layout, tmp: &Path) -> Result<(), SanitizeErro
             check.len(),
             layout.renames.len()
         )));
+    }
+    for (i, want) in expected.iter().enumerate() {
+        let f = check
+            .by_index_raw(i)
+            .map_err(|e| SanitizeError::Io(format!("verify: entry {i}: {e}")))?;
+        if f.size() != *want {
+            return Err(SanitizeError::Io(format!(
+                "verify: entry {} has size {}, expected {}",
+                f.name(),
+                f.size(),
+                want
+            )));
+        }
     }
     Ok(())
 }

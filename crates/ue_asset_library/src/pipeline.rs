@@ -8,9 +8,12 @@
 use crate::archive::{
     group_volumes, kind_of_name, sanitize_archive_with, sevenz_expected_len, ArchiveKind,
 };
+use crate::asset_index::{build_index, write_index};
 use crate::error::{NeedsReview, SanitizeError};
 use crate::lease::{new_body, reclaim_stale, start_heartbeat, LeaseParams};
+use crate::library::LibraryEntry;
 use crate::sanitize::{sanitize_zip_with_options, SanitizeOptions, SanitizeOutcome};
+use crate::sidecar::Kind;
 use crate::util::{is_busy_error, move_unique, rfc3339_utc, unix_secs};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -507,8 +510,8 @@ fn process_claim(
     match outcome {
         Ok(SanitizeOutcome::Sanitized {
             library_zip,
+            sidecar_path,
             sidecar,
-            ..
         }) => {
             log(&format!(
                 "{name}: sanitized -> {} ({:?}, {} entries)",
@@ -534,6 +537,22 @@ fn process_claim(
                 rep.warnings.push(w);
             }
             finish_move(&claim, &dirs.processed, &name, rep, log);
+            // Derived asset index overlay: after the sidecar commit and after the claim is
+            // released, best effort. A failure is only logged and never fails the job.
+            if matches!(sidecar.kind, Kind::Content | Kind::Project) {
+                let le = LibraryEntry {
+                    sidecar: sidecar.clone(),
+                    zip_path: library_zip.clone(),
+                    sidecar_path,
+                };
+                match build_index(&le).and_then(|i| write_index(&le, &i).map(|_| i)) {
+                    Ok(i) => log(&format!(
+                        "{name}: asset index written ({} packages)",
+                        i.packages.len()
+                    )),
+                    Err(e) => log(&format!("WARN: {name}: asset index not written: {e}")),
+                }
+            }
             rep.sanitized.push(name);
         }
         Ok(SanitizeOutcome::Duplicate { existing }) => {
