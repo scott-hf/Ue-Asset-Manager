@@ -503,6 +503,8 @@ fn process_claim(
     let name = claim.name.clone();
     let opts = SanitizeOptions::new(cfg.prefer_engine_versions.clone())
         .with_min_extract_success_ratio(cfg.min_extract_success_ratio);
+    let started = Instant::now();
+    log(&format!("{name}: processing started"));
     let heartbeat = start_heartbeat(claim.claim_path.clone(), cfg.lease_params());
     let outcome = run_sanitize(&claim, &cfg.library_dir, &opts);
     // Stop beating before any final move so a late beat cannot recreate the claim file.
@@ -514,10 +516,11 @@ fn process_claim(
             sidecar,
         }) => {
             log(&format!(
-                "{name}: sanitized -> {} ({:?}, {} entries)",
+                "{name}: sanitized -> {} ({:?}, {} entries, {:.1}s)",
                 library_zip.display(),
                 sidecar.kind,
-                sidecar.entry_count
+                sidecar.entry_count,
+                started.elapsed().as_secs_f32()
             ));
             if let Some(list) = sidecar
                 .extra

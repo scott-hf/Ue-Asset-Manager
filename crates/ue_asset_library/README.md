@@ -179,8 +179,10 @@ schtasks /End /TN "UE Asset Sanitizer"
 Use `/SC ONSTART /RU <account> /RP *` for a task that runs without a logged-in user.
 For a periodic one-shot instead of a resident process use
 `/SC MINUTE /MO 5 ... --once --config ...`. Use absolute paths, or keep the paths in the
-config relative to the config file. `ue_asset_sanitizer` prints to stdout; redirect it in
-the task command (`cmd /c "... >> C:\Tools\sanitizer.log 2>&1"`) when you want a log.
+config relative to the config file. `ue_asset_sanitizer` prints to stdout and, with
+`--log-file <path>` (or a `"log"` object in `sanitizer.json`: `file`, `max_mb`, `keep`, `max_age_days`), also writes a
+timestamped rotating log (default 5 MiB x 5 rotated files, 30 days; worst case `(keep+1) x max_mb`), so no
+redirection is needed.
 
 ## Tests
 

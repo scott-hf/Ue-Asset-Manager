@@ -57,10 +57,31 @@ pub struct JobConfig {
     pub library: PathBuf,
 }
 
+/// Optional `"log"` object of `sanitizer.json`; command-line flags win. No `file` = no log file.
+/// Unknown fields inside are tolerated.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogSettings {
+    /// Log file path (relative paths are resolved against the config file's folder).
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+    /// Rotate above this many MiB (default 5).
+    #[serde(default)]
+    pub max_mb: Option<u64>,
+    /// Rotated files kept (default 5).
+    #[serde(default)]
+    pub keep: Option<u32>,
+    /// Delete rotated files older than this many days (default 30).
+    #[serde(default)]
+    pub max_age_days: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SanitizerConfig {
     pub jobs: Vec<JobConfig>,
+    /// Log file settings (optional).
+    #[serde(default)]
+    pub log: Option<LogSettings>,
     #[serde(default = "default_poll")]
     pub poll_secs: u64,
     #[serde(default = "default_stable")]
@@ -120,6 +141,11 @@ impl SanitizerConfig {
                     j.library = base.join(&j.library);
                 }
             }
+            if let Some(f) = cfg.log.as_mut().and_then(|l| l.file.as_mut()) {
+                if f.is_relative() {
+                    *f = base.join(&*f);
+                }
+            }
         }
         Ok(cfg)
     }
@@ -158,6 +184,17 @@ impl SanitizerConfig {
         }
         if self.poll_secs == 0 {
             return Err("invalid config: \"poll_secs\" must be at least 1".into());
+        }
+        if let Some(l) = &self.log {
+            if l.max_mb == Some(0) || l.max_mb.is_some_and(|v| v > 1024) {
+                return Err("invalid config: \"log.max_mb\" must be 1..=1024".into());
+            }
+            if l.keep.is_some_and(|v| v > 100) {
+                return Err("invalid config: \"log.keep\" must be at most 100".into());
+            }
+            if l.max_age_days == Some(0) {
+                return Err("invalid config: \"log.max_age_days\" must be at least 1".into());
+            }
         }
         Ok(())
     }

@@ -161,6 +161,20 @@ logon task `HFUeAssetSanitizer` runs `--watch`. Deploy/update = copy the new exe
 `ssh scott-server '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -ExecutionPolicy Bypass -File F:/ue_assets_library/_deploy/install.ps1'`
 (forward slashes; backslashes are eaten by the shell).
 
+**Service log.** The task runs the exe with `--log-file C:/HF/ue_asset_sanitizer/logs/sanitizer.log` (source of the
+script: `crates/ue_asset_library/deploy/install.ps1`; copy it to `_deploy\` before running). The logger is
+`ue_asset_library::rotating_log`: lines `<UTC RFC 3339> INFO|WARN|ERROR <message>`, flushed per line, a single line
+capped at 4 KiB. It rotates at 5 MiB (`sanitizer.log` -> `.1` .. `.5`, oldest deleted), so the worst case is
+(5+1) x 5 MiB = 30 MiB; rotated files older than 30 days are removed at startup and on every rotation, and the install
+script also removes stray `*.log*` files older than 30 days. If the file cannot be opened or written the lines go to
+stderr and the open is retried every 30 s; two processes (an old instance still exiting) append to the same file and
+rotation errors are ignored. Options: `--log-file`, `--log-max-mb`, `--log-keep`, `--log-max-age-days`, or a
+`"log": {"file","max_mb","keep","max_age_days"}` object in `sanitizer.json` (flags win; no file = console only).
+What is logged: a startup banner (version, exe, config, jobs, settings, log caps), reconcile actions, one line per
+item (processing started, sanitized with duration, duplicate, needs review, failed, retries, index write warnings),
+job availability changes, panics, and an `alive, N jobs, last pass Xs ago, inbox items M` line every 10 minutes
+(from its own thread, so a hung pass shows as a growing "last pass"). Idle passes log nothing.
+
 ## 3. Design decisions and why
 
 * **Separate sanitizer binary, shared crate**: the server needs no GTK; one owner for the format and
@@ -361,4 +375,6 @@ merged tiles, dialog labels, installed line) was not exercised in a display sess
   for `<name>.review.json` and `failed\` for `.error.txt`.
 * App library paths: Preferences -> Local Library; add `\\scott-server\ue_assets_library\library`.
 * Rebuild/install the app: `.\windows\install.ps1`.
+* Sanitizer log: `C:\HF\ue_asset_sanitizer\logs\sanitizer.log` on scott-server (max 30 MiB in total, see 2.6); look there first
+  when a dropped zip does not show up.
 * Do not commit `data/schemas/` (local schema cache) or `.claude/scratch`.

@@ -18,6 +18,7 @@ pub mod library;
 pub mod name;
 pub mod nested;
 pub mod pipeline;
+pub mod rotating_log;
 pub mod sanitize;
 pub mod sidecar;
 pub mod uasset;
