@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+    <requires lib="gtk" version="4.0"/>
+    <requires lib="libadwaita" version="1.5"/>
+    <template class="EpicAssetsBox" parent="GtkBox">
+        <property name="hexpand">true</property>
+        <property name="vexpand">true</property>
+        <property name="orientation">vertical</property>
+        <property name="css-classes">view</property>
+
+        <!-- Header -->
+        <child>
+            <object class="GtkBox">
+                <property name="css-classes">section-header</property>
+                <property name="spacing">8</property>
+                <property name="margin-start">16</property>
+                <property name="margin-end">16</property>
+                <property name="margin-top">12</property>
+                <property name="margin-bottom">8</property>
+                <child>
+                    <object class="GtkLabel">
+                        <property name="label" translatable="yes">ASSETS</property>
+                        <property name="css-classes">section-title</property>
+                        <property name="halign">start</property>
+                    </object>
+                </child>
+                <child>
+                    <object class="GtkLabel" id="count_label">
+                        <property name="css-classes">section-count</property>
+                        <property name="halign">start</property>
+                        <property name="hexpand">true</property>
+                    </object>
+                </child>
+                <child>
+                    <object class="GtkButton" id="refresh_button">
+                        <property name="icon-name">view-refresh-symbolic</property>
+                        <property name="tooltip-text" translatable="yes">Reload the library</property>
+                        <property name="css-classes">flat</property>
+                    </object>
+                </child>
+            </object>
+        </child>
+        <child>
+            <object class="AdwBanner" id="info_banner">
+                <property name="revealed">false</property>
+            </object>
+        </child>
+
+        <child>
+            <object class="GtkStack" id="content_stack">
+                <property name="vexpand">true</property>
+
+                <!-- Catalog is loading -->
+                <child>
+                    <object class="GtkStackPage">
+                        <property name="name">loading</property>
+                        <property name="child">
+                            <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">12</property>
+                                <property name="halign">center</property>
+                                <property name="valign">center</property>
+                                <child>
+                                    <object class="GtkSpinner">
+                                        <property name="spinning">true</property>
+                                        <property name="width-request">32</property>
+                                        <property name="height-request">32</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkLabel" id="loading_label">
+                                        <property name="label" translatable="yes">Reading the library...</property>
+                                        <property name="css-classes">dim-label</property>
+                                        <property name="wrap">true</property>
+                                        <property name="justify">center</property>
+                                    </object>
+                                </child>
+                            </object>
+                        </property>
+                    </object>
+                </child>
+
+                <!-- Nothing to show -->
+                <child>
+                    <object class="GtkStackPage">
+                        <property name="name">empty</property>
+                        <property name="child">
+                            <object class="AdwStatusPage" id="empty_page">
+                                <property name="icon-name">view-grid-symbolic</property>
+                                <property name="title" translatable="yes">No assets</property>
+                            </object>
+                        </property>
+                    </object>
+                </child>
+
+                <!-- Search page -->
+                <child>
+                    <object class="GtkStackPage">
+                        <property name="name">ready</property>
+                        <property name="child">
+                            <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">8</property>
+                                <property name="margin-start">16</property>
+                                <property name="margin-end">16</property>
+                                <property name="margin-bottom">8</property>
+                                <child>
+                                    <object class="GtkSearchEntry" id="search_entry">
+                                        <property name="placeholder-text" translatable="yes">Search assets, for example grass, rock, door or map:normal</property>
+                                        <property name="search-delay">250</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkBox">
+                                        <property name="spacing">8</property>
+                                        <child>
+                                            <object class="GtkDropDown" id="type_dropdown">
+                                                <property name="tooltip-text" translatable="yes">Asset type</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkDropDown" id="source_dropdown">
+                                                <property name="tooltip-text" translatable="yes">Source</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkDropDown" id="pack_dropdown">
+                                                <property name="tooltip-text" translatable="yes">Pack</property>
+                                                <property name="enable-search">true</property>
+                                                <property name="hexpand">true</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkDropDown" id="project_dropdown">
+                                                <property name="tooltip-text" translatable="yes">Project</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkMenuButton" id="hidden_button">
+                                                <property name="visible">false</property>
+                                                <property name="tooltip-text" translatable="yes">Packs filtered out of the results</property>
+                                                <property name="popover">
+                                                    <object class="GtkPopover">
+                                                        <property name="child">
+                                                            <object class="GtkBox" id="hidden_box">
+                                                                <property name="orientation">vertical</property>
+                                                                <property name="spacing">6</property>
+                                                                <property name="margin-start">8</property>
+                                                                <property name="margin-end">8</property>
+                                                                <property name="margin-top">8</property>
+                                                                <property name="margin-bottom">8</property>
+                                                            </object>
+                                                        </property>
+                                                    </object>
+                                                </property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkCheckButton" id="engine_check">
+                                                <property name="label" translatable="yes">Fits the project's engine</property>
+                                                <property name="tooltip-text" translatable="yes">Only assets that have a release for the project's engine version or older</property>
+                                                <property name="sensitive">false</property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkBox">
+                                        <property name="spacing">8</property>
+                                        <property name="vexpand">true</property>
+                                        <child>
+                                            <object class="GtkScrolledWindow">
+                                                <property name="hexpand">true</property>
+                                                <property name="vexpand">true</property>
+                                                <property name="hscrollbar-policy">never</property>
+                                                <property name="css-classes">card</property>
+                                                <property name="child">
+                                                    <object class="GtkGridView" id="grid_view">
+                                                        <property name="min-columns">2</property>
+                                                        <property name="max-columns">12</property>
+                                                    </object>
+                                                </property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkScrolledWindow" id="detail_scroll">
+                                                <property name="width-request">320</property>
+                                                <property name="hscrollbar-policy">never</property>
+                                                <property name="child">
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">vertical</property>
+                                                        <property name="spacing">8</property>
+                                                        <property name="margin-start">8</property>
+                                                        <property name="margin-end">8</property>
+                                                        <property name="margin-top">4</property>
+                                                        <property name="margin-bottom">8</property>
+                                                        <child>
+                                                            <object class="GtkImage" id="detail_image">
+                                                                <property name="pixel-size">160</property>
+                                                                <property name="icon-name">package-x-generic-symbolic</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkLabel" id="detail_name">
+                                                                <property name="label" translatable="yes">Select an asset to see its details</property>
+                                                                <property name="css-classes">title-3</property>
+                                                                <property name="wrap">true</property>
+                                                                <property name="xalign">0</property>
+                                                                <property name="selectable">true</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkLabel" id="detail_path">
+                                                                <property name="css-classes">caption dim-label</property>
+                                                                <property name="wrap">true</property>
+                                                                <property name="wrap-mode">word-char</property>
+                                                                <property name="xalign">0</property>
+                                                                <property name="selectable">true</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkLabel" id="detail_text">
+                                                                <property name="wrap">true</property>
+                                                                <property name="wrap-mode">word-char</property>
+                                                                <property name="xalign">0</property>
+                                                                <property name="yalign">0</property>
+                                                                <property name="selectable">true</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+
+                                <!-- Footer -->
+                                <child>
+                                    <object class="GtkBox">
+                                        <property name="spacing">8</property>
+                                        <child>
+                                            <object class="GtkBox">
+                                                <property name="orientation">vertical</property>
+                                                <property name="hexpand">true</property>
+                                                <property name="valign">center</property>
+                                                <child>
+                                                    <object class="GtkLabel" id="summary_label">
+                                                        <property name="xalign">0</property>
+                                                        <property name="label" translatable="yes">Nothing selected</property>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkLabel" id="caption_label">
+                                                        <property name="xalign">0</property>
+                                                        <property name="wrap">true</property>
+                                                        <property name="visible">false</property>
+                                                        <property name="css-classes">caption dim-label</property>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkButton" id="more_button">
+                                                <property name="label" translatable="yes">Show more</property>
+                                                <property name="visible">false</property>
+                                                <property name="valign">center</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkButton" id="clear_button">
+                                                <property name="label" translatable="yes">Clear selection</property>
+                                                <property name="sensitive">false</property>
+                                                <property name="valign">center</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkButton" id="add_button">
+                                                <property name="label" translatable="yes">Add to project</property>
+                                                <property name="css-classes">suggested-action</property>
+                                                <property name="sensitive">false</property>
+                                                <property name="valign">center</property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                            </object>
+                        </property>
+                    </object>
+                </child>
+            </object>
+        </child>
+    </template>
+</interface>

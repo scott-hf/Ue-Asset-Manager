@@ -2,6 +2,7 @@ use log::error;
 
 pub mod asset_info;
 pub mod auth;
+pub mod auth_store;
 pub mod category_filter;
 pub mod or;
 

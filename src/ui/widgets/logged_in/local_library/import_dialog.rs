@@ -4,6 +4,7 @@
 //! Flow: pick project -> `preview_import` (worker thread) lists conflicting
 //! files -> `safe_import` (worker thread) -> notification with the result.
 
+use super::asset_picker::{import_result_text, EpicAssetPicker, SubsetChoice};
 use adw::subclass::prelude::AdwWindowImpl;
 use gtk4::glib::clone;
 use gtk4::subclass::prelude::*;
@@ -11,9 +12,13 @@ use gtk4::{self, gio, prelude::*};
 use gtk4::{glib, CompositeTemplate};
 use log::{error, info};
 use std::path::PathBuf;
-use ue_asset_library::{ImportPolicy, LibraryEntry};
+use std::sync::Arc;
+use ue_asset_library::{AssetIndex, ImportPolicy, Kind, LibraryEntry};
 
 const MAX_LISTED_FILES: usize = 40;
+const EVERYTHING_TEXT: &str = "Importing everything";
+const PICK_REQUIRED_TEXT: &str =
+    "A project pack can only be imported into an existing project asset by asset: choose assets.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -45,6 +50,10 @@ pub mod imp {
         pub parent_dir: RefCell<Option<PathBuf>>,
         pub preview_serial: Cell<u64>,
         pub busy: Cell<bool>,
+        /// Assets picked with the picker; `None` imports everything.
+        pub subset: RefCell<Option<SubsetChoice>>,
+        /// Index read by the picker, kept so that reopening it is instant.
+        pub index_cache: RefCell<Option<Arc<AssetIndex>>>,
         pub project_model: gio::ListStore,
         pub sender: async_channel::Sender<(u64, Msg)>,
         pub receiver: RefCell<Option<async_channel::Receiver<(u64, Msg)>>>,
@@ -68,6 +77,14 @@ pub mod imp {
         pub overwrite_section: TemplateChild<gtk4::Box>,
         #[template_child]
         pub overwrite_switch: TemplateChild<gtk4::Switch>,
+        #[template_child]
+        pub subset_section: TemplateChild<gtk4::Box>,
+        #[template_child]
+        pub subset_label: TemplateChild<gtk4::Label>,
+        #[template_child]
+        pub choose_assets_button: TemplateChild<gtk4::Button>,
+        #[template_child]
+        pub clear_subset_button: TemplateChild<gtk4::Button>,
         #[template_child]
         pub status_label: TemplateChild<gtk4::Label>,
         #[template_child]
@@ -93,6 +110,8 @@ pub mod imp {
                 parent_dir: RefCell::new(None),
                 preview_serial: Cell::new(0),
                 busy: Cell::new(false),
+                subset: RefCell::new(None),
+                index_cache: RefCell::new(None),
                 project_model: gio::ListStore::new::<crate::models::project_data::ProjectData>(),
                 sender,
                 receiver: RefCell::new(Some(receiver)),
@@ -106,6 +125,10 @@ pub mod imp {
                 choose_parent_button: TemplateChild::default(),
                 overwrite_section: TemplateChild::default(),
                 overwrite_switch: TemplateChild::default(),
+                subset_section: TemplateChild::default(),
+                subset_label: TemplateChild::default(),
+                choose_assets_button: TemplateChild::default(),
+                clear_subset_button: TemplateChild::default(),
                 status_label: TemplateChild::default(),
                 spinner: TemplateChild::default(),
                 import_button: TemplateChild::default(),
@@ -171,6 +194,16 @@ impl EpicLocalImportDialog {
         let self_ = self.imp();
         let name = entry.sidecar.display_name.clone();
         self_.mode.set(Some(mode));
+        self_
+            .subset_section
+            .set_visible(mode == Mode::ImportToProject && entry.sidecar.kind != Kind::Plugin);
+        self_
+            .subset_label
+            .set_label(if entry.sidecar.kind == Kind::Project {
+                PICK_REQUIRED_TEXT
+            } else {
+                EVERYTHING_TEXT
+            });
         match mode {
             Mode::ImportToProject => {
                 self_
@@ -271,6 +304,17 @@ impl EpicLocalImportDialog {
             move |_| dialog.start_import()
         ));
 
+        self_.choose_assets_button.connect_clicked(clone!(
+            #[weak(rename_to=dialog)]
+            self,
+            move |_| dialog.open_picker()
+        ));
+        self_.clear_subset_button.connect_clicked(clone!(
+            #[weak(rename_to=dialog)]
+            self,
+            move |_| dialog.set_subset(None)
+        ));
+
         // Re-run the preview when the overwrite policy changes.
         self_.overwrite_switch.connect_active_notify(clone!(
             #[weak(rename_to=dialog)]
@@ -336,7 +380,10 @@ impl EpicLocalImportDialog {
         let self_ = self.imp();
         let ready = !self_.busy.get()
             && match self_.mode.get() {
-                Some(Mode::ImportToProject) => self_.selected_project.borrow().is_some(),
+                Some(Mode::ImportToProject) => {
+                    self_.selected_project.borrow().is_some()
+                        && (!self.is_project_pack() || self_.subset.borrow().is_some())
+                }
                 Some(Mode::NewProject) => {
                     self_.parent_dir.borrow().is_some()
                         && !self_.project_name_entry.text().trim().is_empty()
@@ -379,14 +426,26 @@ impl EpicLocalImportDialog {
             self_.status_label.set_label("");
             return;
         };
+        if self.is_project_pack() && self_.subset.borrow().is_none() {
+            self_.preview_serial.set(self_.preview_serial.get() + 1);
+            self_.status_label.set_label(PICK_REQUIRED_TEXT);
+            return;
+        }
         let serial = self_.preview_serial.get() + 1;
         self_.preview_serial.set(serial);
         self_
             .status_label
             .set_label("Checking for existing files...");
         let sender = self_.sender.clone();
+        let subset = self_.subset.borrow().clone();
         std::thread::spawn(move || {
-            let result = ue_asset_library::preview_import(&entry, &root).map_err(|e| e.to_string());
+            let result = match &subset {
+                Some(s) => {
+                    ue_asset_library::preview_import_subset(&entry, &root, &s.index, &s.selection())
+                }
+                None => ue_asset_library::preview_import(&entry, &root),
+            }
+            .map_err(|e| e.to_string());
             let _ = sender.send_blocking((serial, Msg::Preview(root, result)));
         });
     }
@@ -410,9 +469,23 @@ impl EpicLocalImportDialog {
                     ImportPolicy::SkipExisting
                 };
                 let uproject = self_.selected_uproject.borrow().clone();
+                let subset = self_.subset.borrow().clone();
+                if subset.is_none() && self.is_project_pack() {
+                    return;
+                }
                 self.set_busy("Importing...");
                 std::thread::spawn(move || {
-                    let result = ue_asset_library::safe_import(&entry, &root, policy)
+                    let imported = match &subset {
+                        Some(s) => ue_asset_library::safe_import_subset(
+                            &entry,
+                            &root,
+                            policy,
+                            &s.index,
+                            &s.selection(),
+                        ),
+                        None => ue_asset_library::safe_import(&entry, &root, policy),
+                    };
+                    let result = imported
                         .map(|r| {
                             // Remember the install (asset, source, engine version, project, time)
                             if let Some((uproject, project_name)) = &uproject {
@@ -427,17 +500,7 @@ impl EpicLocalImportDialog {
                                     ),
                                 );
                             }
-                            let mut text = format!(
-                                "Imported \"{}\": {} files written, {} skipped, {} backed up.",
-                                entry.sidecar.display_name,
-                                r.written.len(),
-                                r.skipped.len(),
-                                r.backed_up.len()
-                            );
-                            for w in &r.warnings {
-                                text.push_str(&format!(" Warning: {w}"));
-                            }
-                            text
+                            import_result_text(&entry.sidecar.display_name, subset.as_ref(), &r)
                         })
                         .map_err(|e| e.to_string());
                     let _ = sender.send_blocking((serial, Msg::Done(result)));
@@ -471,6 +534,7 @@ impl EpicLocalImportDialog {
         self_.project_section.set_sensitive(false);
         self_.overwrite_section.set_sensitive(false);
         self_.new_project_section.set_sensitive(false);
+        self_.subset_section.set_sensitive(false);
     }
 
     fn handle_msg(&self, serial: u64, msg: Msg) {
@@ -535,12 +599,62 @@ impl EpicLocalImportDialog {
                         self_.project_section.set_sensitive(true);
                         self_.overwrite_section.set_sensitive(true);
                         self_.new_project_section.set_sensitive(true);
+                        self_.subset_section.set_sensitive(true);
                         self_.status_label.set_label(&format!("Import failed: {e}"));
                         self.update_button();
                     }
                 }
             }
         }
+    }
+
+    /// A project pack has no "import everything" into an existing project.
+    fn is_project_pack(&self) -> bool {
+        self.imp()
+            .entry
+            .borrow()
+            .as_ref()
+            .is_some_and(|e| e.sidecar.kind == Kind::Project)
+    }
+
+    /// Open the asset picker for the entry of this dialog.
+    fn open_picker(&self) {
+        let self_ = self.imp();
+        let Some(entry) = self_.entry.borrow().clone() else {
+            return;
+        };
+        let (cached, preselected) = match self_.subset.borrow().as_ref() {
+            Some(s) => (Some(s.index.clone()), s.game_paths.clone()),
+            None => (self_.index_cache.borrow().clone(), Vec::new()),
+        };
+        EpicAssetPicker::present_for(
+            self,
+            entry,
+            cached,
+            &preselected,
+            clone!(
+                #[weak(rename_to=dialog)]
+                self,
+                move |choice| dialog.set_subset(Some(choice))
+            ),
+        );
+    }
+
+    /// Use (or drop, with `None`) a picked subset and refresh what depends on it.
+    fn set_subset(&self, choice: Option<SubsetChoice>) {
+        let self_ = self.imp();
+        match &choice {
+            Some(c) => {
+                self_.subset_label.set_label(&c.label());
+                self_.index_cache.replace(Some(c.index.clone()));
+            }
+            None if self.is_project_pack() => self_.subset_label.set_label(PICK_REQUIRED_TEXT),
+            None => self_.subset_label.set_label(EVERYTHING_TEXT),
+        }
+        self_.clear_subset_button.set_visible(choice.is_some());
+        self_.subset.replace(choice);
+        self.update_button();
+        self.refresh_preview();
     }
 
     fn load_projects(&self) {

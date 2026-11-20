@@ -369,6 +369,7 @@ impl EpicAssetManagerWindow {
             "refresh-token-expiration",
             None,
         );
+        crate::tools::auth_store::clear();
         self_.appmenu_button.set_label("");
         self_.appmenu_button.set_icon_name("open-menu-symbolic");
         self.show_login();
@@ -476,12 +477,25 @@ impl EpicAssetManagerWindow {
             "refresh-token-expiration",
             ud.refresh_expires_at,
         );
+        self.persist_auth_file(ud);
         self.show_logged_in();
         self_.logged_in_stack.set_window(self);
         self_.download_manager.set_window(self);
         self_
             .logged_in_stack
             .set_download_manager(&self_.download_manager);
+    }
+
+    /// Plain-text login file: always on Windows, on Linux only when the
+    /// Secret Service is unavailable.
+    fn persist_auth_file(&self, ud: &egs_api::api::types::account::UserData) {
+        #[cfg(target_os = "linux")]
+        {
+            if self.imp().model.borrow().secret_service.is_some() {
+                return;
+            }
+        }
+        crate::tools::auth_store::save(ud);
     }
 
     pub fn create_info_row(text: &str) -> ListBoxRow {

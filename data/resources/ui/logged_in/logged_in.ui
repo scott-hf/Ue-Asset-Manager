@@ -67,6 +67,16 @@
                     </object>
                 </child>
 
+                <!-- ASSETS PAGE (cross-pack catalog) -->
+                <child>
+                    <object class="GtkStackPage">
+                        <property name="name">assets</property>
+                        <property name="child">
+                            <object class="EpicAssetsBox" id="assets"/>
+                        </property>
+                    </object>
+                </child>
+
                 <!-- GAMES PAGE -->
                 <child>
                     <object class="GtkStackPage">

@@ -2,6 +2,7 @@
 //! directories (see the `ue_asset_library` crate). Works fully offline, no Epic
 //! login data is used.
 
+pub mod asset_picker;
 pub mod fab_match_dialog;
 pub mod import_dialog;
 
@@ -596,11 +597,13 @@ impl EpicLocalLibraryBox {
         }
 
         let is_project = sc.kind == Kind::Project;
-        self_.import_button.set_visible(!is_project);
+        // A project pack can also go into an existing project, asset by asset
+        self_.import_button.set_visible(true);
         self_.new_project_button.set_visible(is_project);
         self_.import_button.set_label(match sc.kind {
             Kind::Plugin => "Install plugin to project",
-            _ => "Import to project",
+            Kind::Project => "Import assets to project",
+            Kind::Content => "Import to project",
         });
         self_.detail_scroll.set_visible(true);
         self_.detail_separator.set_visible(true);

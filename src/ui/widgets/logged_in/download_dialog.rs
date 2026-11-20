@@ -17,6 +17,9 @@ use crate::models::project_data::ProjectData;
 use crate::models::project_registry::{self as registry, VersionSource};
 use crate::ui::widgets::download_manager::asset::Asset;
 use crate::ui::widgets::download_manager::{EpicDownloadManager, PostDownloadAction};
+use crate::ui::widgets::logged_in::local_library::asset_picker::{
+    import_result_text, EpicAssetPicker, SubsetChoice,
+};
 use crate::window::EpicAssetManagerWindow;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -27,8 +30,11 @@ use gtk4::{self, gio, glib, CompositeTemplate, StringList};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Mutex;
-use ue_asset_library::{ImportPolicy, Kind, LibraryEntry};
+use std::sync::{Arc, Mutex};
+use ue_asset_library::{AssetIndex, ImportPolicy, Kind, LibraryEntry};
+
+const PICK_REQUIRED_TEXT: &str =
+    "A project pack can only be added to an existing project asset by asset: choose assets.";
 
 /// Last project choice made in this session (`Some(None)` = vault only).
 static LAST_PROJECT: Mutex<Option<Option<String>>> = Mutex::new(None);
@@ -44,7 +50,7 @@ pub struct Subject {
     /// Epic catalog items, the one with the thumbnail first.
     pub epic: Vec<AssetInfo>,
     pub fab: Option<FabAsset>,
-    /// Local library zips (never of kind `Project`).
+    /// Local library zips. A `Project` pack can only be imported asset by asset.
     pub local: Vec<LibraryEntry>,
     /// Plugins go to `<project>/Plugins/<PluginName>/` only.
     pub is_plugin: bool,
@@ -60,10 +66,6 @@ impl Subject {
         local: Vec<LibraryEntry>,
         fab_first: bool,
     ) -> Self {
-        let local: Vec<LibraryEntry> = local
-            .into_iter()
-            .filter(|e| e.sidecar.kind != Kind::Project)
-            .collect();
         let title = epic
             .first()
             .and_then(|a| a.title.clone())
@@ -169,6 +171,10 @@ pub mod imp {
         pub vault_dirs: RefCell<Vec<String>>,
         /// The install log as it was when the dialog opened.
         pub install_records: RefCell<Vec<InstallRecord>>,
+        /// Assets picked for a local zip (sha256 of the zip, choice); `None` imports everything.
+        pub subset: RefCell<Option<(String, SubsetChoice)>>,
+        /// Index read by the picker, per zip sha256, so that reopening it is instant.
+        pub index_cache: RefCell<Option<(String, Arc<AssetIndex>)>>,
         #[template_child]
         pub asset_label: TemplateChild<gtk4::Label>,
         #[template_child]
@@ -191,6 +197,14 @@ pub mod imp {
         pub overwrite_box: TemplateChild<gtk4::Box>,
         #[template_child]
         pub overwrite_switch: TemplateChild<gtk4::Switch>,
+        #[template_child]
+        pub subset_box: TemplateChild<gtk4::Box>,
+        #[template_child]
+        pub subset_label: TemplateChild<gtk4::Label>,
+        #[template_child]
+        pub choose_assets_button: TemplateChild<gtk4::Button>,
+        #[template_child]
+        pub clear_subset_button: TemplateChild<gtk4::Button>,
         #[template_child]
         pub hint_label: TemplateChild<gtk4::Label>,
         #[template_child]
@@ -216,6 +230,8 @@ pub mod imp {
                 versions: RefCell::new(Vec::new()),
                 vault_dirs: RefCell::new(Vec::new()),
                 install_records: RefCell::new(Vec::new()),
+                subset: RefCell::new(None),
+                index_cache: RefCell::new(None),
                 asset_label: TemplateChild::default(),
                 installed_label: TemplateChild::default(),
                 project_box: TemplateChild::default(),
@@ -227,6 +243,10 @@ pub mod imp {
                 vault_dropdown: TemplateChild::default(),
                 overwrite_box: TemplateChild::default(),
                 overwrite_switch: TemplateChild::default(),
+                subset_box: TemplateChild::default(),
+                subset_label: TemplateChild::default(),
+                choose_assets_button: TemplateChild::default(),
+                clear_subset_button: TemplateChild::default(),
                 hint_label: TemplateChild::default(),
                 cancel_button: TemplateChild::default(),
                 download_button: TemplateChild::default(),
@@ -358,6 +378,16 @@ impl EpicDownloadDialog {
             move |_| {
                 dialog.confirm();
             }
+        ));
+        self_.choose_assets_button.connect_clicked(clone!(
+            #[weak(rename_to=dialog)]
+            self,
+            move |_| dialog.open_picker()
+        ));
+        self_.clear_subset_button.connect_clicked(clone!(
+            #[weak(rename_to=dialog)]
+            self,
+            move |_| dialog.set_subset(None)
         ));
         self_.project_dropdown.connect_selected_notify(clone!(
             #[weak(rename_to=dialog)]
@@ -585,12 +615,13 @@ impl EpicDownloadDialog {
     /// A local zip can only be imported into a project; everything else can go to the vault.
     fn update_action_state(&self) {
         let self_ = self.imp();
+        self.update_subset_ui();
         let Some(version) = self.selected_version() else {
             return;
         };
         let has_project = self.selected_project_path().is_some();
         if has_project {
-            self_.download_button.set_sensitive(true);
+            self_.download_button.set_sensitive(!self.needs_pick());
             return;
         }
         if matches!(version.origin, Origin::Local(_)) {
@@ -604,6 +635,92 @@ impl EpicDownloadDialog {
                 .hint_label
                 .set_label("The asset is downloaded to the vault only.");
         }
+    }
+
+    /// The selected version when it is a local Content or Project zip (the kinds the index
+    /// supports; plugins are imported whole).
+    fn selected_local_entry(&self) -> Option<LibraryEntry> {
+        match self.selected_version()?.origin {
+            Origin::Local(entry) if entry.sidecar.kind != Kind::Plugin => Some(entry),
+            _ => None,
+        }
+    }
+
+    /// Show the "Choose assets..." row only for a local zip going into a project, and drop a
+    /// pick that was made for another zip.
+    fn update_subset_ui(&self) {
+        let self_ = self.imp();
+        let local = self.selected_local_entry();
+        let sha = local.as_ref().map(|e| e.sidecar.sha256.clone());
+        let stale = self_
+            .subset
+            .borrow()
+            .as_ref()
+            .is_some_and(|(picked, _)| Some(picked) != sha.as_ref());
+        if stale {
+            self_.subset.replace(None);
+        }
+        let label = match self_.subset.borrow().as_ref() {
+            Some((_, choice)) => choice.label(),
+            None if self.needs_pick() => PICK_REQUIRED_TEXT.to_string(),
+            None => "Importing everything".to_string(),
+        };
+        self_.subset_label.set_label(&label);
+        self_
+            .clear_subset_button
+            .set_visible(self_.subset.borrow().is_some());
+        self_
+            .subset_box
+            .set_visible(local.is_some() && self.selected_project_path().is_some());
+    }
+
+    /// A project pack can only go into an existing project asset by asset.
+    fn needs_pick(&self) -> bool {
+        self.selected_local_entry()
+            .is_some_and(|e| e.sidecar.kind == Kind::Project)
+            && self.imp().subset.borrow().is_none()
+    }
+
+    fn open_picker(&self) {
+        let self_ = self.imp();
+        let (Some(entry), Some(window)) = (self.selected_local_entry(), self_.window.get()) else {
+            return;
+        };
+        let sha = entry.sidecar.sha256.clone();
+        let (cached, preselected) = match self_.subset.borrow().as_ref() {
+            Some((picked, c)) if *picked == sha => (Some(c.index.clone()), c.game_paths.clone()),
+            _ => (
+                self_
+                    .index_cache
+                    .borrow()
+                    .as_ref()
+                    .filter(|(cached_sha, _)| *cached_sha == sha)
+                    .map(|(_, index)| index.clone()),
+                Vec::new(),
+            ),
+        };
+        EpicAssetPicker::present_for(
+            window,
+            entry,
+            cached,
+            &preselected,
+            clone!(
+                #[weak(rename_to=dialog)]
+                self,
+                move |choice| dialog.set_subset(Some((sha.clone(), choice)))
+            ),
+        );
+    }
+
+    fn set_subset(&self, choice: Option<(String, SubsetChoice)>) {
+        let self_ = self.imp();
+        if let Some((sha, c)) = &choice {
+            self_
+                .index_cache
+                .replace(Some((sha.clone(), c.index.clone())));
+        }
+        self_.subset.replace(choice);
+        self.update_subset_ui();
     }
 
     /// "Installed on MM/DD/YYYY [in <project>]": the selected project's most recent install when
@@ -980,6 +1097,15 @@ impl EpicDownloadDialog {
         } else {
             ImportPolicy::SkipExisting
         };
+        if entry.sidecar.kind == Kind::Project && self.needs_pick() {
+            return;
+        }
+        let subset: Option<SubsetChoice> = self_
+            .subset
+            .borrow()
+            .as_ref()
+            .filter(|(sha, _)| *sha == entry.sidecar.sha256)
+            .map(|(_, choice)| choice.clone());
         let record = InstallRecord::new(
             &entry.sidecar.sha256,
             &entry.sidecar.display_name,
@@ -998,20 +1124,18 @@ impl EpicDownloadDialog {
             gtk4::MessageType::Info,
         );
         let handle = gio::spawn_blocking(move || {
-            let result = ue_asset_library::safe_import(&entry, &root, policy)
-                .map(|r| {
-                    let mut text = format!(
-                        "Imported \"{}\": {} files written, {} skipped, {} backed up.",
-                        entry.sidecar.display_name,
-                        r.written.len(),
-                        r.skipped.len(),
-                        r.backed_up.len()
-                    );
-                    for w in &r.warnings {
-                        text.push_str(&format!(" Warning: {w}"));
-                    }
-                    text
-                })
+            let imported = match &subset {
+                Some(s) => ue_asset_library::safe_import_subset(
+                    &entry,
+                    &root,
+                    policy,
+                    &s.index,
+                    &s.selection(),
+                ),
+                None => ue_asset_library::safe_import(&entry, &root, policy),
+            };
+            let result = imported
+                .map(|r| import_result_text(&entry.sidecar.display_name, subset.as_ref(), &r))
                 .map_err(|e| e.to_string());
             if result.is_ok() {
                 install_log::record_install(record);

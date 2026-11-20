@@ -139,6 +139,36 @@
                             </object>
                         </child>
 
+                        <!-- Selective import (Content / Plugin kinds) -->
+                        <child>
+                            <object class="GtkBox" id="subset_section">
+                                <property name="spacing">8</property>
+                                <property name="visible">false</property>
+                                <child>
+                                    <object class="GtkLabel" id="subset_label">
+                                        <property name="label" translatable="yes">Importing everything</property>
+                                        <property name="hexpand">true</property>
+                                        <property name="halign">start</property>
+                                        <property name="wrap">true</property>
+                                        <property name="xalign">0</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkButton" id="clear_subset_button">
+                                        <property name="label" translatable="yes">Import everything</property>
+                                        <property name="visible">false</property>
+                                        <property name="valign">center</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkButton" id="choose_assets_button">
+                                        <property name="label" translatable="yes">Choose assets...</property>
+                                        <property name="valign">center</property>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+
                         <!-- Conflict preview / status -->
                         <child>
                             <object class="GtkScrolledWindow" id="status_scroll">

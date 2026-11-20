@@ -30,6 +30,9 @@
         <file compressed="true" preprocess="xml-stripblanks" alias="local_library.ui">ui/logged_in/local_library/local_library.ui</file>
         <file compressed="true" preprocess="xml-stripblanks" alias="local_import_dialog.ui">ui/logged_in/local_library/local_import_dialog.ui</file>
         <file compressed="true" preprocess="xml-stripblanks" alias="fab_match_dialog.ui">ui/logged_in/local_library/fab_match_dialog.ui</file>
+        <file compressed="true" preprocess="xml-stripblanks" alias="asset_picker.ui">ui/logged_in/local_library/asset_picker.ui</file>
+        <file compressed="true" preprocess="xml-stripblanks" alias="assets.ui">ui/logged_in/assets/assets.ui</file>
+        <file compressed="true" preprocess="xml-stripblanks" alias="assets_add_dialog.ui">ui/logged_in/assets/assets_add_dialog.ui</file>
         <file compressed="true" preprocess="xml-stripblanks" alias="fab.ui">ui/logged_in/fab/fab.ui</file>
         <file compressed="true" preprocess="xml-stripblanks" alias="project.ui">ui/logged_in/projects/project.ui</file>
         <file compressed="true" preprocess="xml-stripblanks" alias="project_detail.ui">ui/logged_in/projects/project_detail.ui</file>

@@ -286,16 +286,34 @@ impl Model {
     }
 
     fn load_secrets_insecure(&self) {
-        let mut ud = egs_api::api::types::account::UserData::new();
-        if let Some((token, exp)) = self.load_egs_secrets_insecure("token") {
-            ud.expires_at = Some(exp);
-            ud.token_type = Some("bearer".to_string());
-            ud.set_access_token(Some(token));
-        };
-        if let Some((token, exp)) = self.load_egs_secrets_insecure("refresh-token") {
-            ud.refresh_expires_at = Some(exp);
-            ud.set_refresh_token(Some(token));
-        };
+        // Prefer the plain-text login file; fall back to the GSettings keys.
+        let mut ud = crate::tools::auth_store::load()
+            .map(|stored| stored.to_user_data(chrono::Utc::now()))
+            .unwrap_or_else(egs_api::api::types::account::UserData::new);
+        if ud.access_token().is_none() && ud.refresh_token().is_none() {
+            if let Some((token, exp)) = self.load_egs_secrets_insecure("token") {
+                ud.expires_at = Some(exp);
+                ud.token_type = Some("bearer".to_string());
+                ud.set_access_token(Some(token));
+            };
+            if let Some((token, exp)) = self.load_egs_secrets_insecure("refresh-token") {
+                ud.refresh_expires_at = Some(exp);
+                ud.set_refresh_token(Some(token));
+            };
+        }
+        info!(
+            "Startup login state: access token {}, refresh token {}",
+            if ud.access_token().is_some() {
+                "valid"
+            } else {
+                "none/expired"
+            },
+            if ud.refresh_token().is_some() {
+                "valid"
+            } else {
+                "none/expired"
+            },
+        );
         self.epic_games.borrow_mut().set_user_details(ud);
 
         let gh_token = self.settings.string("github-token");

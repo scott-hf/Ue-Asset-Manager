@@ -1,8 +1,10 @@
 use crate::ui::widgets::logged_in::refresh::Refresh;
+use gtk4::glib::clone;
 use gtk4::subclass::prelude::*;
 use gtk4::{self, prelude::*};
 use gtk4::{glib, CompositeTemplate};
 
+pub mod assets;
 pub mod download_dialog;
 pub mod engines;
 pub mod fab;
@@ -44,6 +46,8 @@ pub mod imp {
         pub local_library:
             TemplateChild<crate::ui::widgets::logged_in::local_library::EpicLocalLibraryBox>,
         #[template_child]
+        pub assets: TemplateChild<crate::ui::widgets::logged_in::assets::EpicAssetsBox>,
+        #[template_child]
         pub details:
             TemplateChild<crate::ui::widgets::logged_in::library::asset_detail::EpicAssetDetails>,
         pub settings: gtk4::gio::Settings,
@@ -67,6 +71,7 @@ pub mod imp {
                 games: TemplateChild::default(),
                 fab: TemplateChild::default(),
                 local_library: TemplateChild::default(),
+                assets: TemplateChild::default(),
                 details: TemplateChild::default(),
                 settings: gtk4::gio::Settings::new(crate::config::APP_ID),
             }
@@ -163,6 +168,17 @@ impl EpicLoggedInBox {
         self_.fab.set_details(&self_.details);
         self_.fab.set_window(&window.clone());
         self_.local_library.set_window(&window.clone());
+        self_.assets.set_window(&window.clone());
+        // The catalog is read the first time the page is shown
+        self_.page_stack.connect_visible_child_name_notify(clone!(
+            #[weak(rename_to=logged_in)]
+            self,
+            move |stack| {
+                if stack.visible_child_name().as_deref() == Some("assets") {
+                    logged_in.imp().assets.on_shown();
+                }
+            }
+        ));
     }
 
     /// Select the local library page (and its sidebar button).

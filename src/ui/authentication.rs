@@ -2,7 +2,7 @@ use crate::window::EpicAssetManagerWindow;
 use chrono::{DateTime, Utc};
 use gtk4::prelude::SettingsExt;
 use gtk4::subclass::prelude::ObjectSubclassIsExt;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::thread;
 
 impl EpicAssetManagerWindow {
@@ -55,13 +55,22 @@ impl EpicAssetManagerWindow {
         let self_: &crate::window::imp::EpicAssetManagerWindow = self.imp();
         let now = chrono::Utc::now();
         let user_details = self_.model.borrow().epic_games.borrow().user_details();
-        crate::tools::auth::can_relogin(
+        // Expiries come from the restored session itself (plain-text file or
+        // fallback storage), not from GSettings keys that may not persist.
+        let can = crate::tools::auth::can_relogin(
             now,
-            self.token_time("token-expiration"),
+            user_details.expires_at,
             user_details.access_token().is_some(),
-            self.token_time("refresh-token-expiration"),
+            user_details.refresh_expires_at,
             user_details.refresh_token().is_some(),
-        )
+        );
+        info!(
+            "Startup relogin possible: {} (access token {}, refresh token {})",
+            can,
+            user_details.access_token().is_some(),
+            user_details.refresh_token().is_some()
+        );
+        can
     }
 
     pub fn relogin(&self) {
@@ -71,11 +80,13 @@ impl EpicAssetManagerWindow {
         thread::spawn(move || {
             let start = std::time::Instant::now();
             if crate::RUNTIME.block_on(eg.login()) {
+                info!("Relogin succeeded, tokens will be persisted");
                 Self::setup_cosmos_session(&mut eg);
                 sender
                     .send_blocking(crate::ui::messages::Msg::LoginOk(eg.user_details()))
                     .unwrap();
             } else {
+                warn!("Relogin failed (refresh token rejected or expired, or network error)");
                 sender
                     .send_blocking(crate::ui::messages::Msg::LoginFailed(
                         "Relogin request failed".to_string(),

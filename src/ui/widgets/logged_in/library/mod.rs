@@ -548,10 +548,7 @@ impl EpicLibraryBox {
             .local_entries
             .borrow()
             .iter()
-            .filter(|(l, k)| {
-                l.entry.sidecar.kind != ue_asset_library::Kind::Project
-                    && library_merge::matches_local(&keys, k)
-            })
+            .filter(|(_, k)| library_merge::matches_local(&keys, k))
             .map(|(l, _)| l.entry.clone())
             .collect();
         (epics, locals)

@@ -51,6 +51,13 @@
                             </object>
                         </child>
                         <child>
+                            <object class="EpicSidebarButton" id="assets_category">
+                                <property name="icon-name">system-search-symbolic</property>
+                                <property name="path">assets</property>
+                                <property name="tooltip-text" translatable="yes">Assets</property>
+                            </object>
+                        </child>
+                        <child>
                             <object class="EpicSidebarButton" id="games_category">
                                 <property name="icon-name">input-gaming-symbolic</property>
                                 <property name="filter">games|dlc</property>
