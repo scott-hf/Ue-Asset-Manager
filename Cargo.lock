@@ -1113,6 +1113,7 @@ dependencies = [
  "sha-1",
  "threadpool",
  "tokio",
+ "ue_asset_catalog",
  "ue_asset_library",
  "version-compare",
  "winres",
@@ -4579,6 +4580,16 @@ dependencies = [
  "memoffset",
  "tempfile",
  "winapi",
+]
+
+[[package]]
+name = "ue_asset_catalog"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ue_asset_library",
+ "zip",
 ]
 
 [[package]]

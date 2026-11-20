@@ -1,0 +1,26 @@
+[package]
+name = "ue_asset_catalog"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+description = "Cross-pack asset catalog, auto-tagger and stdio MCP server over the local Unreal asset library"
+
+[lib]
+name = "ue_asset_catalog"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ue_asset_mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "ue_asset_enrich"
+path = "src/bin/ue_asset_enrich.rs"
+
+[dependencies]
+ue_asset_library = { path = "../ue_asset_library" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+zip = "8"
