@@ -13,6 +13,7 @@
 //! (pool full = 503). The access log has method, path, status and milliseconds only: never the
 //! token, a header value or a body.
 
+use crate::bundles::{self, BundleStore, Lease, LeaseError};
 use crate::catalog::{fingerprint, Catalog, LoadReport};
 use crate::generated::FetchReport;
 use crate::mcp::{Server, PROTOCOL_VERSIONS};
@@ -141,7 +142,8 @@ struct Shared {
     mcp_pool: Pool,
     bundle_pool: Pool,
     connections: AtomicUsize,
-    bundles_pending: AtomicUsize,
+    /// Hosted bundles (`prepare_import`, `GET /bundles/<id>`); `None` = every id is unknown.
+    bundles: Option<Arc<BundleStore>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -174,23 +176,7 @@ fn rfc3339_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
+    bundles::rfc3339_unix(secs)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -202,6 +188,8 @@ struct Resp {
     content_type: &'static str,
     body: Vec<u8>,
     extra: Vec<(&'static str, String)>,
+    /// The response was already streamed to the peer (a bundle download).
+    sent: bool,
 }
 
 impl Resp {
@@ -211,6 +199,7 @@ impl Resp {
             content_type: "application/json",
             body: v.to_string().into_bytes(),
             extra: Vec::new(),
+            sent: false,
         }
     }
 
@@ -220,6 +209,15 @@ impl Resp {
             content_type: "application/json",
             body: Vec::new(),
             extra: Vec::new(),
+            sent: false,
+        }
+    }
+
+    /// Log-only marker for a response that was streamed.
+    fn streamed(status: u16) -> Resp {
+        Resp {
+            sent: true,
+            ..Resp::empty(status)
         }
     }
 
@@ -423,6 +421,11 @@ fn write_response(stream: &mut TcpStream, resp: &Resp) {
     out.extend_from_slice(&resp.body);
     let _ = stream.write_all(&out);
     let _ = stream.flush();
+    linger(stream);
+}
+
+/// Close our side and swallow what the client may still be sending.
+fn linger(stream: &mut TcpStream) {
     let _ = stream.shutdown(Shutdown::Write);
     // Swallow what the client may still be sending so an early error is not turned into a reset.
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
@@ -471,9 +474,52 @@ fn health(shared: &Shared) -> Resp {
             "assets": shared.assets.load(Ordering::SeqCst),
             "catalog_generation": shared.generation.load(Ordering::SeqCst),
             "catalog_loaded_at": lock(&shared.loaded_at).clone(),
-            "bundles_pending": shared.bundles_pending.load(Ordering::SeqCst),
+            "bundles_pending": shared.bundles.as_ref().map_or(0, |b| b.pending()),
         }),
     )
+}
+
+/// `tools/call prepare_import`: resolve the request under the catalog lock (short), then build
+/// and publish the bundle WITHOUT it, so searches keep answering while a bundle is built.
+/// `None` = not a prepare_import call (the generic handler answers it).
+fn prepare_import_reply(shared: &Shared, store: &BundleStore, msg: &Value) -> Option<Value> {
+    if msg.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let id = msg.get("id")?.clone();
+    let params = msg.get("params")?;
+    if params.get("name").and_then(Value::as_str) != Some("prepare_import") {
+        return None;
+    }
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let args = match args {
+        Value::Null => json!({}),
+        Value::Object(_) => args,
+        _ => return None,
+    };
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let job = lock(&shared.server).app.prepare_job(&args, generation);
+    let result: Result<Value, String> = match job {
+        Err(e) => Err(e),
+        Ok(job) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bundles::prepare(store, job)
+        })) {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(refusal)) => Err(refusal.text()),
+            Err(_) => {
+                eprintln!("[ue_asset_mcp] tool `prepare_import` panicked");
+                Err("internal error while running `prepare_import`".to_string())
+            }
+        },
+    };
+    let (text, is_error) = match result {
+        Ok(v) => (v.to_string(), false),
+        Err(e) => (format!("error: {e}"), true),
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id, "result": {
+        "content": [{"type": "text", "text": text}],
+        "isError": is_error
+    }}))
 }
 
 fn mcp_post(
@@ -531,6 +577,11 @@ fn mcp_post(
                     "isError": true
                 }}),
             );
+        }
+    }
+    if let Some(store) = &shared.bundles {
+        if let Some(reply) = prepare_import_reply(shared, store, &msg) {
+            return Resp::json(200, &reply);
         }
     }
     // The lock covers only the message handling (a tool's catalog work).
@@ -639,12 +690,58 @@ fn respond(
             let Some(_permit) = shared.bundle_pool.acquire() else {
                 return busy();
             };
-            // The bundle store is added by the bundle work (prepare_import); until a bundle
-            // exists every id is unknown.
-            Resp::error(404, "NOT_FOUND", "no such bundle")
+            let id = req.path.strip_prefix("/bundles/").unwrap_or("");
+            let Some(store) = &shared.bundles else {
+                return Resp::error(404, "NOT_FOUND", "no such bundle");
+            };
+            match store.lease(id) {
+                Err(LeaseError::NotFound) => Resp::error(404, "NOT_FOUND", "no such bundle"),
+                Err(LeaseError::Expired) => Resp::error(
+                    410,
+                    "BUNDLE_EXPIRED",
+                    "the bundle has expired; call prepare_import again",
+                ),
+                // The worker permit is held until the last byte is written.
+                Ok(lease) => stream_bundle(stream, lease),
+            }
         }
         Route::Unknown => Resp::error(404, "NOT_FOUND", "no such path"),
     }
+}
+
+/// Stream an admitted bundle: headers, then the file in chunks (never held in memory, never under
+/// the catalog lock). Each write call has the write deadline; a peer that stops reading is cut off.
+fn stream_bundle(stream: &mut TcpStream, lease: Lease) -> Resp {
+    let Lease {
+        id,
+        file,
+        size,
+        sha256,
+    } = lease;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {size}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Bundle-Sha256: {sha256}\r\nX-Bundle-Id: {id}\r\n\r\n"
+    );
+    if stream.write_all(head.as_bytes()).is_err() {
+        return Resp::streamed(499);
+    }
+    let mut src = file.take(size);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut sent = 0u64;
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Resp::streamed(500),
+        };
+        if stream.write_all(&buf[..n]).is_err() {
+            return Resp::streamed(499);
+        }
+        sent += n as u64;
+    }
+    let _ = stream.flush();
+    // A short file leaves the client with fewer bytes than Content-Length: it re-prepares.
+    Resp::streamed(if sent == size { 200 } else { 500 })
 }
 
 fn busy() -> Resp {
@@ -658,7 +755,11 @@ fn handle_conn(shared: &Shared, mut stream: TcpStream) {
     let Some((method, path, resp)) = process(shared, &mut stream) else {
         return;
     };
-    write_response(&mut stream, &resp);
+    if resp.sent {
+        linger(&mut stream);
+    } else {
+        write_response(&mut stream, &resp);
+    }
     eprintln!(
         "[ue_asset_mcp] http {method} {path} {} {}ms",
         resp.status,
@@ -793,6 +894,10 @@ pub fn start(
         allowed_hosts.push(local_addr.to_string());
     }
     let limits = opts.limits;
+    let bundles = match app.cfg.bundle.clone() {
+        Some(cfg) => Some(Arc::new(BundleStore::open(cfg)?)),
+        None => None,
+    };
     let shared = Arc::new(Shared {
         read_only: app.cfg.read_only,
         server: Mutex::new(Server::new(app)),
@@ -807,9 +912,26 @@ pub fn start(
         generation: AtomicU64::new(0),
         loaded_at: Mutex::new(String::new()),
         connections: AtomicUsize::new(0),
-        bundles_pending: AtomicUsize::new(0),
+        bundles,
     });
     let stop = Arc::new(AtomicBool::new(false));
+
+    if let Some(store) = shared.bundles.clone() {
+        let stop = stop.clone();
+        thread::Builder::new()
+            .name("bundle-sweep".into())
+            .spawn(move || {
+                let every = store.config().sweep_interval;
+                let mut next = Instant::now() + every;
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(25));
+                    if Instant::now() >= next {
+                        store.sweep();
+                        next = Instant::now() + every;
+                    }
+                }
+            })?;
+    }
 
     {
         let shared = shared.clone();

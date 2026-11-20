@@ -57,8 +57,8 @@ hand-rolled `std::net` listener, still no HTTP crate or async runtime).
 * Routes: `POST /mcp` (one JSON-RPC message per request: 200 with the reply, 202 for a
   notification, 400 for a batch or broken JSON or an unknown `MCP-Protocol-Version`, 411 without
   `Content-Length`, 413 over 1 MiB, 405 on other methods), `GET /health` (open; status, version,
-  `read_only`, packs, assets, `catalog_generation`, `catalog_loaded_at`), `GET /bundles/<id>` (404
-  until the bundle store exists). Every response is `Connection: close`; read deadline 10 s, write
+  `read_only`, packs, assets, `catalog_generation`, `catalog_loaded_at`, `bundles_pending`),
+  `GET /bundles/<id>` (see "Prepared bundles" below). Every response is `Connection: close`; read deadline 10 s, write
   timeout 60 s, header block <= 16 KiB; worker pools 8 (`/mcp`, `/health`) and 2 (`/bundles`), a full
   pool answers 503 `BUSY`.
 * The catalog loads on a background thread after the port is bound: `/health` reports
@@ -73,6 +73,49 @@ hand-rolled `std::net` listener, still no HTTP crate or async runtime).
   attacker on the LAN could read the token. Reopen if an untrusted device joins, the service leaves
   the LAN, or per-client revocation is needed. Never bind a wildcard address; the token plus the
   interface binding are the only access control.
+
+### Prepared bundles (`prepare_import`)
+
+With `--bundle-dir <dir>` the hosted server also offers `prepare_import`, the one tool that stays
+registered under `--read-only`. It builds a verified zip on the server; the client downloads it and
+applies it to its own project. The server never touches a project and never writes into the library.
+
+```
+ue_asset_mcp ... --http 192.168.12.201:8433 --token-file ... --bundle-dir C:\HF\ue_asset_mcp\bundles
+```
+
+* Arguments: `asset_ids` (1 to 500 catalog ids), `project_engine_version` (e.g. `5.4`), and
+  `include_deps` (default true: the in-pack dependency closure is added). There is no plan id and no
+  server-side plan state. The release of each pack follows the catalog's no-downgrade rule.
+* The zip holds `manifest.json` plus the selected packages, their companions (`.uexp`, `.ubulk`, ...)
+  and the in-pack dependencies as byte-exact copies of the source entries under `Content/<path>`
+  (`.uexp` and `.ubulk` stored, everything else deflated). `manifest.json` lists every file with
+  `path`, `size` and `sha256` (over the uncompressed bytes), plus `bundle_id`, `catalog_generation`,
+  `project_engine_version`, `engine_verdict`, `omitted_deps`, `external_missing`, `warnings` and
+  `total_uncompressed_bytes`. Entry names are validated like an import (no `..`, drive letters,
+  reserved names or case clashes); two packs that put different bytes at one path are a `CONFLICT`
+  and identical bytes are written once.
+* Result: `bundle_id`, `size_bytes`, `uncompressed_bytes`, `bundle_sha256`, `files` (first 200) and
+  `files_total`, `verdict`, `packs`, `omitted_deps` and `external_missing` (each up to 200, with a
+  `_total`), `warnings`, `expires_at` and `download` (`/bundles/<id>`).
+* Errors (`isError`, text `error: <CODE>: ...`): `NOT_FOUND` (an unknown asset id), `CONFLICT`,
+  `BUSY` (the build slot or the cache budget is taken; retry shortly), `CAP_EXCEEDED` (the bundle or
+  the hourly budget is over its cap; the text names the size and the cap), `NOT_AVAILABLE` (the server
+  has no `--bundle-dir`).
+* `GET /bundles/<id>` needs the same bearer token and answers 200 with `Content-Length`,
+  `X-Bundle-Sha256`, `X-Bundle-Id` and `Content-Type: application/zip`. It can be repeated until the
+  bundle expires, 15 minutes after it was published; then 410 `BUNDLE_EXPIRED`. An id that never
+  existed (or is not 32 hex digits) is 404. A bundle is published by an atomic rename, so a
+  download never sees a partial file.
+* The build and the download never hold the catalog lock: a search answers while a bundle builds or
+  streams. One build runs at a time.
+* `import_assets` and the install log are not involved: nothing is recorded server-side.
+* Flags (all need `--http`): `--bundle-dir <dir>` (server-local; refused when it is inside, or
+  contains, a library folder), `--bundle-ttl-secs` (900), `--max-bundle-bytes` (256 MiB),
+  `--max-cache-bytes` (2 GiB on disk), `--max-builds` (1) and `--max-hour-bytes` (1 GiB of bundles
+  per rolling hour; alias `--max-session-bytes`). Expired bundles, interrupted builds and stale
+  temporary files in the folder are swept at startup and every minute; only files named
+  `<32 hex>.zip` and `.tmp-<32 hex>` are ever removed.
 
 ## Claude Code (`.mcp.json`)
 

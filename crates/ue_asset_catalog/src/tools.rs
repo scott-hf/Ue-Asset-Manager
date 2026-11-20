@@ -5,6 +5,7 @@
 //! [`ToolOutput`] (the protocol layer turns that into an `isError` result).
 
 use crate::b64;
+use crate::bundles::{BundleConfig, PrepareJob};
 use crate::catalog::{Asset, Catalog, LoadOptions, LoadReport, Pack, PackStatus, SourceKind};
 use crate::generated::{self, FetchReport, PortalConfig};
 use crate::generation::{self, GenerationConfig};
@@ -59,6 +60,18 @@ blueprints, Niagara systems, animations and sounds; (2) get_asset / get_thumbnai
 hit (ids look like `<packId>:<gamePath>`); list_packs / get_pack / list_tags help you browse. \
 This server never writes anything: it cannot import into a project.";
 
+/// The `initialize` instructions of the hosted profile (read-only plus bundles).
+pub const INSTRUCTIONS_HOSTED: &str = "\
+This server is a read-only offline catalog of every asset inside a library of Unreal Engine asset \
+packs (zip archives that you never need to open). Workflow: (1) search_assets with plain words \
+(\"grass\", \"stone wall\", \"wooden door\") to find existing meshes, materials, textures, \
+blueprints, Niagara systems, animations and sounds; (2) get_asset / get_thumbnail to inspect a \
+hit (ids look like `<packId>:<gamePath>`); list_packs / get_pack / list_tags help you browse; \
+(3) to use assets in your own Unreal project call prepare_import with the asset ids and your \
+project's engine version: the server builds one verified bundle (a zip plus a manifest with a \
+SHA-256 per file) that your client downloads from the returned `download` path and applies to \
+your project. This server never writes into any project and cannot import by itself.";
+
 /// A project the server is allowed to write into.
 pub use crate::import::ProjectTarget as Registered;
 
@@ -80,6 +93,8 @@ pub struct AppConfig {
     pub read_only: bool,
     /// Never rescan from the request path (the HTTP server rescans on a background thread).
     pub no_auto_refresh: bool,
+    /// Hosted bundles (`prepare_import` + `GET /bundles/<id>`); `None` = the tool is hidden.
+    pub bundle: Option<BundleConfig>,
 }
 
 /// Tools refused (and hidden) in the read-only profile. The generation pair stays available only
@@ -95,9 +110,10 @@ const GENERATION_TOOLS: [&str; 2] = ["request_generation", "generation_status"];
 impl AppConfig {
     /// Is `name` unavailable in this configuration?
     pub fn tool_blocked(&self, name: &str) -> bool {
-        self.read_only
-            && (WRITE_TOOLS.contains(&name)
-                || (GENERATION_TOOLS.contains(&name) && !self.generation.allowed))
+        (name == "prepare_import" && self.bundle.is_none())
+            || (self.read_only
+                && (WRITE_TOOLS.contains(&name)
+                    || (GENERATION_TOOLS.contains(&name) && !self.generation.allowed)))
     }
 }
 
@@ -407,6 +423,27 @@ pub fn tool_definitions() -> Vec<Value> {
             &["project", "asset_ids", "confirm_plan_id"],
         ),
         tool(
+            "prepare_import",
+            "Hosted server only. Build ONE verified bundle of existing library assets for use in YOUR \
+             Unreal project: the selected assets, their companion files (.uexp/.ubulk) and, with \
+             include_deps (default true), the assets they depend on inside the same pack, as a zip \
+             with a manifest (SHA-256 per file). Picks for each pack the release that fits \
+             `project_engine_version` (exact, else the highest not above it, else the lowest with a \
+             warning: assets can be upgraded but never downgraded). Writes nothing into any project: \
+             the result has a `download` path (`/bundles/<bundle_id>`, same bearer token) that your \
+             client fetches within `expires_at` and applies to the project. The result also lists \
+             `files`, `verdict`, `warnings`, `omitted_deps` (in-pack dependencies not included) and \
+             `external_missing` (referenced packages that are not in the pack and would be missing). \
+             Errors: CAP_EXCEEDED (too big; names size and cap), CONFLICT (two packs fill one path \
+             with different bytes), BUSY (another bundle is being built; retry), NOT_FOUND.",
+            json!({
+                "asset_ids": {"type": "array", "items": {"type": "string"}, "description": "Asset ids from search_assets (any mix of packs), 1 to 500."},
+                "project_engine_version": {"type": "string", "description": "Engine version of your project, e.g. `5.4`."},
+                "include_deps": {"type": "boolean", "description": "Also bundle the in-pack assets these depend on. Default true."}
+            }),
+            &["asset_ids", "project_engine_version"],
+        ),
+        tool(
             "request_generation",
             "LAST RESORT: ask the mesh/sound generation pipeline to make an asset the library does not \
              have. ALWAYS run search_assets first (generated and pack assets are both searched) and only \
@@ -480,7 +517,9 @@ impl App {
 
     /// The `initialize` instructions of this configuration.
     pub fn instructions(&self) -> &'static str {
-        if self.cfg.read_only {
+        if self.cfg.read_only && self.cfg.bundle.is_some() {
+            INSTRUCTIONS_HOSTED
+        } else if self.cfg.read_only {
             INSTRUCTIONS_READ_ONLY
         } else {
             INSTRUCTIONS
@@ -582,9 +621,16 @@ impl App {
             "refresh_catalog",
             "request_generation",
             "generation_status",
+            "prepare_import",
         ];
         if !known.contains(&name) {
             return None;
+        }
+        if name == "prepare_import" {
+            // Built by the HTTP server outside the catalog lock (`App::prepare_job`).
+            return Some(ToolOutput::error(
+                "NOT_AVAILABLE: prepare_import is served only by `ue_asset_mcp --http` with --bundle-dir",
+            ));
         }
         if self.cfg.tool_blocked(name) {
             return Some(ToolOutput::error(format!(
@@ -617,6 +663,29 @@ impl App {
         Some(match r {
             Ok(v) => ToolOutput::json(&v),
             Err(e) => ToolOutput::error(e),
+        })
+    }
+
+    /// Resolve a `prepare_import` request against the current catalog (cheap, no file access).
+    /// The caller runs [`crate::bundles::prepare`] with the result after releasing its lock.
+    /// Errors are the tool error text (`CODE: message` or a plain argument message).
+    pub fn prepare_job(&self, args: &Value, catalog_generation: u64) -> Result<PrepareJob, String> {
+        let ids = str_list(args, "asset_ids")?;
+        if ids.is_empty() || ids.len() > MAX_IMPORT_IDS {
+            return Err(format!(
+                "`asset_ids` needs 1 to {MAX_IMPORT_IDS} ids (see search_assets)"
+            ));
+        }
+        let ver = req_str(args, "project_engine_version")?;
+        let engine = parse_version(&ver)
+            .ok_or_else(|| format!("project_engine_version `{ver}` is not a version like 5.4"))?;
+        let include_deps = opt_bool(args, "include_deps")?.unwrap_or(true);
+        let assets = import::resolve_assets(&self.catalog, &ids, MAX_IMPORT_IDS)
+            .map_err(|e| format!("NOT_FOUND: {e}"))?;
+        let plan = import::plan_bundle(&self.catalog, &assets, engine, include_deps)?;
+        Ok(PrepareJob {
+            plan,
+            catalog_generation,
         })
     }
 
@@ -1390,6 +1459,7 @@ mod tests {
             "plan_import",
             "import_assets",
             "refresh_catalog",
+            "prepare_import",
         ] {
             assert!(names.contains(&n), "{n}");
         }

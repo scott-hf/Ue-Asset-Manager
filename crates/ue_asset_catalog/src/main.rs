@@ -5,6 +5,7 @@
 use std::io::{self, BufReader};
 use std::net::TcpListener;
 use std::process::ExitCode;
+use ue_asset_catalog::bundles;
 use ue_asset_catalog::catalog::Catalog;
 use ue_asset_catalog::config::{parse_args, HttpConfig, Mode, Parsed, USAGE};
 use ue_asset_catalog::http_server::{self, Limits, StartOptions};
@@ -89,12 +90,36 @@ fn run_http(cfg: AppConfig, http: &HttpConfig) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(b) = &cfg.bundle {
+        // The bundle folder is the only place this server writes: never inside the library.
+        if let Err(e) = std::fs::create_dir_all(&b.dir) {
+            eprintln!(
+                "ue_asset_mcp: cannot create --bundle-dir {}: {e}",
+                b.dir.display()
+            );
+            return ExitCode::from(1);
+        }
+        for lib in &cfg.libraries {
+            if bundles::is_inside(&b.dir, lib) || bundles::is_inside(lib, &b.dir) {
+                eprintln!(
+                    "ue_asset_mcp: --bundle-dir must be server-local and apart from the library folder {}",
+                    lib.display()
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
     let listener = match TcpListener::bind(http.addr) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("ue_asset_mcp: cannot bind {}: {e}", http.addr);
             return ExitCode::from(1);
         }
+    };
+    let bundles_state = if cfg.bundle.is_some() {
+        "on"
+    } else {
+        "off (no --bundle-dir)"
     };
     let loader_cfg = cfg.clone();
     let app = App::with_catalog(Catalog::empty(), cfg);
@@ -115,8 +140,8 @@ fn run_http(cfg: AppConfig, http: &HttpConfig) -> ExitCode {
         }
     };
     eprintln!(
-        "[ue_asset_mcp] listening on http://{} (read-only; catalog loading in the background)",
-        running.local_addr
+        "[ue_asset_mcp] listening on http://{} (read-only; bundles {}; catalog loading in the background)",
+        running.local_addr, bundles_state
     );
     running.wait();
     ExitCode::SUCCESS

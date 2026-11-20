@@ -15,8 +15,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use ue_asset_library::{
-    closure, preview_import_subset, safe_import_subset, ImportPolicy, ImportReport, Kind,
-    PackageInfo, Selection,
+    closure, preview_import_subset, safe_import_subset, AssetIndex, ImportPolicy, ImportReport,
+    Kind, LibraryEntry, PackageInfo, Selection,
 };
 
 /// A project that may be written to.
@@ -469,6 +469,136 @@ pub fn plan_import(
         packs,
         warnings,
         assets: canonical_ids(catalog, assets),
+    })
+}
+
+/// What will be bundled from one pack (hosted server; everything the build needs is owned, so
+/// the catalog lock is not held while the bundle is written).
+#[derive(Clone, Debug)]
+pub struct BundlePackPlan {
+    pub pack_id: String,
+    pub pack_name: String,
+    /// Engine label of the chosen release (`5.3` or `5.0-5.8`).
+    pub pack_engine: Option<String>,
+    /// `exact`, `older`, `newer` (every release is newer than the project) or `unknown`.
+    pub verdict: &'static str,
+    pub entry: LibraryEntry,
+    pub index: AssetIndex,
+    pub selection: Selection,
+    /// Uncompressed bytes of the selection plus its dependencies (from the asset index).
+    pub estimated_bytes: u64,
+}
+
+/// A bundle request resolved against the catalog. Nothing has been written.
+#[derive(Clone, Debug)]
+pub struct BundlePlan {
+    pub engine: Version,
+    pub include_deps: bool,
+    pub packs: Vec<BundlePackPlan>,
+    pub warnings: Vec<String>,
+    pub estimated_bytes: u64,
+}
+
+/// Like [`plan_import`] for a client project this server cannot see: only the engine version of
+/// that project is known, so there is no clash preview. Release choice, dependency closure,
+/// verdicts and warnings are the same.
+pub fn plan_bundle(
+    catalog: &Catalog,
+    assets: &[usize],
+    engine: Version,
+    include_deps: bool,
+) -> Result<BundlePlan, String> {
+    if let Some(&g) = assets
+        .iter()
+        .find(|&&a| catalog.assets[a].source == SourceKind::Generated)
+    {
+        return Err(format!(
+            "{} is a generated asset (finished pipeline job); it is not part of the pack library and cannot be bundled",
+            catalog.assets[g].id
+        ));
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    let (by_pack, verdicts) = assign_packs(catalog, assets, Some(engine), &mut warnings)?;
+    let mut packs: Vec<BundlePackPlan> = Vec::new();
+    for (pi, paths) in &by_pack {
+        let pack = &catalog.packs[*pi];
+        let index = pack
+            .index
+            .as_ref()
+            .ok_or_else(|| format!("pack {} has no index", pack.display_name))?;
+        let mut selected = paths.clone();
+        selected.sort();
+        selected.dedup();
+        let needed: Vec<String> = if include_deps {
+            closure(index, &selected)
+        } else {
+            selected.clone()
+        };
+        let by_gp: HashMap<String, &PackageInfo> = index
+            .packages
+            .iter()
+            .map(|p| (p.game_path.to_ascii_lowercase(), p))
+            .collect();
+        let mut size = 0u64;
+        let mut unreadable = 0usize;
+        let mut reasons: BTreeSet<String> = BTreeSet::new();
+        for g in &needed {
+            let Some(p) = by_gp.get(&g.to_ascii_lowercase()) else {
+                continue;
+            };
+            size += p.size;
+            if p.header_unreadable {
+                unreadable += 1;
+                reasons.insert(
+                    p.unreadable_reason
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                );
+            }
+        }
+        let verdict = verdicts.get(pi).copied().unwrap_or("unknown");
+        let pack_engine = pack.engine_label();
+        match (verdict, &pack_engine) {
+            ("newer", Some(pe)) => warnings.push(format!(
+                "{}: pack is for UE {pe} but the project is on {}; assets saved by a newer engine usually cannot be opened",
+                pack.display_name,
+                format_version(engine)
+            )),
+            ("older", Some(pe)) => warnings.push(format!(
+                "{}: pack is for UE {pe}, the project is on {}; Unreal upgrades the assets when they are opened and saved",
+                pack.display_name,
+                format_version(engine)
+            )),
+            _ => {}
+        }
+        if unreadable > 0 {
+            warnings.push(format!(
+                "{}: {unreadable} package(s) could not be analysed (reason: {}); their dependencies are unknown and may be missing",
+                pack.display_name,
+                reasons.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        packs.push(BundlePackPlan {
+            pack_id: pack.id.clone(),
+            pack_name: pack.display_name.clone(),
+            pack_engine,
+            verdict,
+            entry: pack.entry.clone(),
+            index: index.clone(),
+            selection: Selection {
+                game_paths: selected,
+                include_deps,
+            },
+            estimated_bytes: size,
+        });
+    }
+    let estimated_bytes = packs.iter().map(|p| p.estimated_bytes).sum();
+    Ok(BundlePlan {
+        engine,
+        include_deps,
+        packs,
+        warnings,
+        estimated_bytes,
     })
 }
 

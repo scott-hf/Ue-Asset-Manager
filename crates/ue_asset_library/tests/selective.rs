@@ -8,8 +8,9 @@ use ue_asset_library::pipeline::{run_once, Config, Dirs};
 use ue_asset_library::uasset::synth::Synth;
 use ue_asset_library::{
     build_index, closure, index_path, load_or_build_index, preview_import_subset, read_thumbnail,
-    safe_import, safe_import_subset, sanitize_zip, scan_library, AssetIndex, ImportError,
-    ImportPolicy, Kind, LibraryEntry, SanitizeOutcome, Selection, INDEX_SCHEMA,
+    safe_import, safe_import_subset, sanitize_zip, scan_library, AssetIndex, BundleError,
+    BundleWriter, ImportError, ImportPolicy, Kind, LibraryEntry, SanitizeOutcome, Selection,
+    BUNDLE_MANIFEST, INDEX_SCHEMA,
 };
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -416,6 +417,193 @@ fn subset_without_deps_imports_just_the_selection() {
     );
     assert!(rep.warnings.iter().any(|w| w.contains("not imported")));
     assert_eq!(rep.external_missing, s(&["/Game/Other/Thing"]));
+}
+
+// ---- bundle export (hosted server) ----
+
+fn sha_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
+}
+
+fn zip_bytes(zip: &mut zip::ZipArchive<fs::File>, name: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut v = Vec::new();
+    zip.by_name(name).unwrap().read_to_end(&mut v).unwrap();
+    v
+}
+
+#[test]
+fn bundle_manifest_hashes_equal_the_source_entry_bytes() {
+    let t = Tmp::new();
+    let (entry, g) = grass_entry(&t, false);
+    let idx = build_index(&entry).unwrap();
+    let out = t.path().join("bundle.zip");
+    let mut w = BundleWriter::create(&out, 1 << 20).unwrap();
+    let ex = w
+        .add_subset(&entry, &idx, &sel(&["/Game/Grass/Meshes/SM_A"], true))
+        .unwrap();
+    assert_eq!(ex.files, 6);
+    assert_eq!(
+        ex.external_missing,
+        s(&["/Game/Elsewhere/Z", "/Game/Other/Thing"])
+    );
+    assert!(ex.unselected_deps.is_empty());
+    let mut m = serde_json::Map::new();
+    m.insert("bundle_id".into(), serde_json::json!("abc"));
+    let done = w.finish(m).unwrap();
+
+    // Companions and in-pack dependencies are in, the unrelated files are not.
+    let paths: Vec<&str> = done.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "Content/Grass/Materials/M_A.uasset",
+            "Content/Grass/Materials/M_A.uexp",
+            "Content/Grass/Meshes/SM_A.uasset",
+            "Content/Grass/Textures/T_A.m.ubulk",
+            "Content/Grass/Textures/T_A.uasset",
+            "Content/Grass/Textures/T_A.ubulk",
+        ]
+    );
+    assert_eq!(
+        done.uncompressed_bytes,
+        done.files.iter().map(|f| f.size).sum::<u64>()
+    );
+
+    // The zip: exactly the files plus manifest.json; compression per type; bytes exact.
+    let mut bundle = zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap();
+    let mut names: Vec<String> = bundle.file_names().map(str::to_string).collect();
+    names.sort();
+    let mut want: Vec<String> = done.files.iter().map(|f| f.path.clone()).collect();
+    want.push(BUNDLE_MANIFEST.to_string());
+    want.sort();
+    assert_eq!(names, want);
+    for f in &done.files {
+        let method = bundle.by_name(&f.path).unwrap().compression();
+        let stored = f.path.ends_with(".uexp") || f.path.ends_with(".ubulk");
+        assert_eq!(
+            method,
+            if stored {
+                CompressionMethod::Stored
+            } else {
+                CompressionMethod::Deflated
+            },
+            "{}",
+            f.path
+        );
+    }
+    let mut source = zip::ZipArchive::new(fs::File::open(&entry.zip_path).unwrap()).unwrap();
+    for f in &done.files {
+        let in_bundle = zip_bytes(&mut bundle, &f.path);
+        let in_source = zip_bytes(&mut source, &f.path);
+        assert_eq!(in_bundle, in_source, "{}", f.path);
+        assert_eq!(f.sha256, sha_hex(&in_source), "{}", f.path);
+        assert_eq!(f.size, in_source.len() as u64);
+    }
+    assert_eq!(
+        zip_bytes(&mut bundle, "Content/Grass/Meshes/SM_A.uasset"),
+        g.sm_a
+    );
+
+    // The manifest agrees with the outcome.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&zip_bytes(&mut bundle, BUNDLE_MANIFEST)).unwrap();
+    assert_eq!(manifest["format"], 1);
+    assert_eq!(manifest["bundle_id"], "abc");
+    assert_eq!(
+        manifest["total_uncompressed_bytes"],
+        done.uncompressed_bytes
+    );
+    let listed = manifest["files"].as_array().unwrap();
+    assert_eq!(listed.len(), done.files.len());
+    for (a, b) in listed.iter().zip(&done.files) {
+        assert_eq!(a["path"], b.path.as_str());
+        assert_eq!(a["sha256"], b.sha256.as_str());
+        assert_eq!(a["size"], b.size);
+    }
+    // The zip hash is over the finished file.
+    assert_eq!(done.sha256, sha_hex(&fs::read(&out).unwrap()));
+    assert_eq!(done.size_bytes, fs::metadata(&out).unwrap().len());
+}
+
+#[test]
+fn bundle_without_deps_reports_the_omitted_ones_and_respects_the_cap() {
+    let t = Tmp::new();
+    let (entry, _) = grass_entry(&t, false);
+    let idx = build_index(&entry).unwrap();
+
+    let out = t.path().join("a.zip");
+    let mut w = BundleWriter::create(&out, 1 << 20).unwrap();
+    let ex = w
+        .add_subset(&entry, &idx, &sel(&["/Game/Grass/Meshes/SM_A"], false))
+        .unwrap();
+    assert_eq!(ex.files, 1);
+    assert_eq!(ex.unselected_deps, s(&["/Game/Grass/Materials/M_A"]));
+    assert_eq!(ex.external_missing, s(&["/Game/Other/Thing"]));
+    let done = w.finish(serde_json::Map::new()).unwrap();
+    assert_eq!(done.files.len(), 1);
+
+    // A cap below the content is refused before anything is copied.
+    let out = t.path().join("b.zip");
+    let mut w = BundleWriter::create(&out, 10).unwrap();
+    match w.add_subset(&entry, &idx, &sel(&["/Game/Grass/Meshes/SM_A"], true)) {
+        Err(BundleError::CapExceeded { size, cap }) => {
+            assert!(size > 10);
+            assert_eq!(cap, 10);
+        }
+        other => panic!("expected CapExceeded, got {other:?}"),
+    }
+    // An existing file is never overwritten.
+    assert!(BundleWriter::create(&out, 10).is_err());
+    // Nothing selected, unknown package.
+    let mut w = BundleWriter::create(&t.path().join("c.zip"), 1 << 20).unwrap();
+    assert!(matches!(
+        w.add_subset(&entry, &idx, &sel(&[], true)),
+        Err(BundleError::Import(ImportError::EmptySelection))
+    ));
+    assert!(matches!(
+        w.add_subset(&entry, &idx, &sel(&["/Game/Nope"], true)),
+        Err(BundleError::Import(ImportError::UnknownPackage(_)))
+    ));
+}
+
+#[test]
+fn bundle_dedupes_identical_paths_and_refuses_different_bytes() {
+    let t = Tmp::new();
+    let (entry, _) = grass_entry(&t, false);
+    let idx = build_index(&entry).unwrap();
+    let pick = sel(&["/Game/Grass/Meshes/SM_B"], true);
+
+    // The same pack twice: identical bytes are written once.
+    let mut w = BundleWriter::create(&t.path().join("same.zip"), 1 << 20).unwrap();
+    w.add_subset(&entry, &idx, &pick).unwrap();
+    let before = w.total_bytes();
+    let again = w.add_subset(&entry, &idx, &pick).unwrap();
+    assert_eq!(again.files, 1);
+    assert_eq!(w.total_bytes(), before);
+    let done = w.finish(serde_json::Map::new()).unwrap();
+    assert_eq!(done.files.len(), 1);
+
+    // A second pack that fills the same Content path with different bytes is a conflict.
+    let src2 = t.path().join("Other Pack 5.3.zip");
+    let mut other = Synth::new("StaticMesh", "SM_B").name("/Game/Grass/Meshes/SM_B");
+    other.body = vec![9; 16];
+    make_zip(&src2, &[("GrassPack/Meshes/SM_B.uasset", other.build())]);
+    let entry2 = sanitized(&src2, &t.dir("lib2"));
+    let idx2 = build_index(&entry2).unwrap();
+    let mut w = BundleWriter::create(&t.path().join("clash.zip"), 1 << 20).unwrap();
+    w.add_subset(&entry, &idx, &pick).unwrap();
+    w.add_subset(&entry2, &idx2, &pick).unwrap();
+    match w.finish(serde_json::Map::new()) {
+        Err(BundleError::Conflict(paths)) => {
+            assert_eq!(paths, s(&["Content/Grass/Meshes/SM_B.uasset"]));
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
 }
 
 #[test]

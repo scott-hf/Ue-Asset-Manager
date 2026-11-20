@@ -1,11 +1,19 @@
 //! Command line and config file of `ue_asset_mcp`.
 
+use crate::bundles::BundleConfig;
 use crate::catalog::LoadOptions;
 use crate::install_log;
 use crate::tools::AppConfig;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+
+fn number(v: &str, flag: &str) -> Result<u64, String> {
+    v.trim()
+        .parse()
+        .map_err(|_| format!("{flag} needs a number (got `{v}`)"))
+}
 
 pub const USAGE: &str = "\
 ue_asset_mcp - stdio MCP server over the local Unreal asset library
@@ -39,6 +47,14 @@ OPTIONS:
                         interface address (0.0.0.0 and :: are refused); implies --read-only.
   --token-file <file>   Bearer token for --http (required; exit 2 if missing or empty). Never logged.
   --allowed-host <h:p>  Extra accepted Host header value (repeatable; default: the --http address).
+  --bundle-dir <dir>    With --http: server-local folder for import bundles; turns on the prepare_import
+                        tool and GET /bundles/<id>. The server writes only here (never the library).
+  --bundle-ttl-secs <n> Seconds a bundle stays downloadable, from publication (default 900).
+  --max-bundle-bytes <n>  Cap of one bundle, uncompressed (default 268435456).
+  --max-cache-bytes <n>   Cap of the bundle folder, published plus being built (default 2147483648).
+  --max-builds <n>        Bundles built at the same time (default 1).
+  --max-hour-bytes <n>    Uncompressed bytes bundled per rolling hour, all clients (default 1073741824;
+                          alias --max-session-bytes).
   --read-only           Hide and refuse every tool that writes or changes state (import_assets,
                         plan_import, list_projects, refresh_catalog; the generation tools unless
                         --allow-generation). Cannot be combined with --write-overlays.
@@ -102,6 +118,9 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut token_file: Option<PathBuf> = None;
     let mut allowed_hosts: Vec<String> = Vec::new();
     let mut read_only = false;
+    let mut bundle_dir: Option<PathBuf> = None;
+    let mut bundle = BundleConfig::new(PathBuf::new());
+    let mut bundle_flags = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -140,6 +159,39 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--no-install-log" => use_log = false,
             "--selftest" => mode = Mode::SelfTest,
             "--read-only" => read_only = true,
+            "--bundle-dir" => {
+                bundle_dir = Some(PathBuf::from(value("--bundle-dir")?));
+                bundle_flags = true;
+            }
+            "--bundle-ttl-secs" => {
+                let n: u64 = number(&value("--bundle-ttl-secs")?, "--bundle-ttl-secs")?;
+                if n == 0 {
+                    return Err("--bundle-ttl-secs must be at least 1".to_string());
+                }
+                bundle.ttl = Duration::from_secs(n);
+                bundle_flags = true;
+            }
+            "--max-bundle-bytes" => {
+                bundle.max_bundle_bytes =
+                    number(&value("--max-bundle-bytes")?, "--max-bundle-bytes")?;
+                bundle_flags = true;
+            }
+            "--max-cache-bytes" => {
+                bundle.max_cache_bytes = number(&value("--max-cache-bytes")?, "--max-cache-bytes")?;
+                bundle_flags = true;
+            }
+            "--max-builds" => {
+                let n: u64 = number(&value("--max-builds")?, "--max-builds")?;
+                if n == 0 {
+                    return Err("--max-builds must be at least 1".to_string());
+                }
+                bundle.max_builds = n as usize;
+                bundle_flags = true;
+            }
+            "--max-hour-bytes" | "--max-session-bytes" => {
+                bundle.max_hour_bytes = number(&value(a)?, a)?;
+                bundle_flags = true;
+            }
             "--http" => {
                 let v = value("--http")?;
                 let addr: SocketAddr = v
@@ -174,9 +226,16 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             return Err("--selftest cannot be combined with --http".to_string());
         }
         read_only = true; // the hosted profile is always read-only
-    } else if token_file.is_some() || !allowed_hosts.is_empty() {
-        return Err("--token-file and --allowed-host need --http".to_string());
+    } else if token_file.is_some() || !allowed_hosts.is_empty() || bundle_flags {
+        return Err("--token-file, --allowed-host and the bundle flags need --http".to_string());
     }
+    let bundle = match bundle_dir {
+        Some(dir) if http.is_some() => {
+            bundle.dir = dir;
+            Some(bundle)
+        }
+        _ => None,
+    };
     if read_only && write_overlays {
         return Err(
             "--read-only (and --http) cannot be combined with --write-overlays".to_string(),
@@ -222,6 +281,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             generation,
             read_only,
             no_auto_refresh: matches!(mode, Mode::Http(_)),
+            bundle,
         },
         mode,
     ))

@@ -33,7 +33,8 @@ pub use asset_index::{
 pub use error::{ImportError, NeedsReview, SanitizeError};
 pub use import::{
     preview_import, preview_import_subset, safe_import, safe_import_new_project,
-    safe_import_subset, ImportPolicy, ImportReport, Selection,
+    safe_import_subset, BundleError, BundleFile, BundleOutcome, BundleWriter, ImportPolicy,
+    ImportReport, Selection, SubsetExport, BUNDLE_FORMAT, BUNDLE_MANIFEST,
 };
 pub use layout::{plan_layout, EntryRename, Layout};
 pub use library::{scan_library, LibraryEntry};

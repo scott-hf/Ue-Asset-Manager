@@ -41,8 +41,11 @@
 //! * [`vision`] / [`enrich`]: optional vision-model descriptions (`<zip>.vision.json`).
 //! * [`mcp`] / [`tools`] / [`config`]: the JSON-RPC server, its tools and command line.
 //! * [`http_server`]: the read-only HTTP transport (`--http`), std::net only.
+//! * [`bundles`]: the hosted bundle store (`prepare_import`, `GET /bundles/<id>`): a verified zip
+//!   plus manifest the client applies to its own project.
 
 pub mod b64;
+pub mod bundles;
 pub mod catalog;
 pub mod config;
 pub mod enrich;

@@ -2,16 +2,21 @@
 
 use crate::asset_index::{closure, under_content, AssetIndex, PackageInfo};
 use crate::error::{ImportError, NeedsReview};
-use crate::harden::{under_root, EntryInfo};
+use crate::harden::{check_paths, under_root, EntryInfo};
 use crate::library::LibraryEntry;
 use crate::sidecar::Kind;
-use crate::util::{compact_utc, move_file, unique_token, unix_secs};
+use crate::util::{compact_utc, move_file, sha256_file, unique_token, unix_secs};
 use crate::zipfix::{scan_with_repairs, Repairs};
+use serde::Serialize;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use zip::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportPolicy {
@@ -470,6 +475,310 @@ pub fn safe_import_subset(
     }
     report.external_missing = plan.external_missing;
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------------------------
+// bundle export (hosted server): selected packages as one verified zip, nothing is imported
+// ---------------------------------------------------------------------------------------------
+
+/// `format` value of `manifest.json`.
+pub const BUNDLE_FORMAT: u32 = 1;
+/// Name of the manifest entry at the zip root.
+pub const BUNDLE_MANIFEST: &str = "manifest.json";
+
+/// One file of a bundle: project-relative path (`Content/...`, forward slashes), its size and the
+/// SHA-256 over the uncompressed bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BundleFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// What one [`BundleWriter::add_subset`] call resolved.
+#[derive(Clone, Debug, Default)]
+pub struct SubsetExport {
+    /// Files of the selection (including ones another pack already contributed identically).
+    pub files: usize,
+    /// Packages referenced by the selection that are NOT in the pack.
+    pub external_missing: Vec<String>,
+    /// In-pack dependencies of the selection that were not added (`include_deps == false`).
+    pub unselected_deps: Vec<String>,
+}
+
+/// The finished bundle file.
+#[derive(Clone, Debug)]
+pub struct BundleOutcome {
+    /// Sorted by path.
+    pub files: Vec<BundleFile>,
+    pub uncompressed_bytes: u64,
+    /// Size of the zip file.
+    pub size_bytes: u64,
+    /// SHA-256 of the zip file.
+    pub sha256: String,
+}
+
+#[derive(Debug)]
+pub enum BundleError {
+    Import(ImportError),
+    /// Content paths that two packs fill with different bytes (or that differ only in case).
+    Conflict(Vec<String>),
+    /// The bundle would hold `size` uncompressed bytes; the cap is `cap`.
+    CapExceeded {
+        size: u64,
+        cap: u64,
+    },
+    Io(String),
+}
+
+impl fmt::Display for BundleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BundleError::Import(e) => write!(f, "{e}"),
+            BundleError::Conflict(p) => {
+                write!(f, "packs disagree about: {}", p.join(", "))
+            }
+            BundleError::CapExceeded { size, cap } => {
+                write!(f, "bundle of {size} bytes exceeds the cap of {cap} bytes")
+            }
+            BundleError::Io(s) => write!(f, "i/o error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for BundleError {}
+
+impl From<ImportError> for BundleError {
+    fn from(e: ImportError) -> Self {
+        BundleError::Import(e)
+    }
+}
+
+impl From<io::Error> for BundleError {
+    fn from(e: io::Error) -> Self {
+        BundleError::Io(e.to_string())
+    }
+}
+
+impl From<zip::result::ZipError> for BundleError {
+    fn from(e: zip::result::ZipError) -> Self {
+        BundleError::Io(e.to_string())
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Copy up to `size` bytes (plus one, to notice an over-long entry) from `r` into `sink` and
+/// return how many were read with their SHA-256.
+fn pump(r: &mut dyn Read, size: u64, sink: &mut dyn Write) -> io::Result<(u64, String)> {
+    let mut limited = r.take(size + 1);
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut n = 0u64;
+    loop {
+        let k = match limited.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        h.update(&buf[..k]);
+        sink.write_all(&buf[..k])?;
+        n += k as u64;
+    }
+    Ok((n, hex(&h.finalize())))
+}
+
+/// Stream one zip entry (through the repair view when its zip64 record is malformed) into `sink`.
+fn stream_entry(
+    zip: &mut Zip,
+    repairs: &Repairs,
+    e: &EntryInfo,
+    sink: &mut dyn Write,
+) -> Result<(u64, String), ImportError> {
+    let (n, sha) = if repairs.has(&e.path) {
+        repairs.with_entry(&e.path, |r| pump(r, e.size, sink))?
+    } else {
+        let mut f = zip.by_index(e.index)?;
+        pump(&mut f, e.size, sink)?
+    };
+    if n != e.size {
+        return Err(ImportError::SizeMismatch(format!(
+            "{}: expected {} bytes, got {}",
+            e.path, e.size, n
+        )));
+    }
+    Ok((n, sha))
+}
+
+/// Writes a bundle zip: the selected packages, their companions and (with `include_deps`) in-pack
+/// dependencies of one or more packs, every entry under `Content/<rel>`, plus `manifest.json`.
+///
+/// Bytes are copied exactly (the manifest hashes are over the uncompressed bytes). `.uexp` and
+/// `.ubulk` are Stored, everything else Deflated. The same project path from two packs is written
+/// once when the bytes are identical and is a conflict (reported by [`BundleWriter::finish`]) when
+/// they differ. Nothing here touches the library: sources are only read.
+pub struct BundleWriter {
+    zip: ZipWriter<BufWriter<File>>,
+    path: PathBuf,
+    files: Vec<BundleFile>,
+    by_lower: HashMap<String, usize>,
+    total: u64,
+    cap: u64,
+    conflicts: BTreeSet<String>,
+}
+
+impl BundleWriter {
+    /// Create a new zip at `path` (must not exist). `max_uncompressed` caps the sum of the file
+    /// sizes.
+    pub fn create(path: &Path, max_uncompressed: u64) -> Result<BundleWriter, BundleError> {
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(BundleWriter {
+            zip: ZipWriter::new(BufWriter::with_capacity(1 << 20, f)),
+            path: path.to_path_buf(),
+            files: Vec::new(),
+            by_lower: HashMap::new(),
+            total: 0,
+            cap: max_uncompressed,
+            conflicts: BTreeSet::new(),
+        })
+    }
+
+    /// Uncompressed bytes written so far.
+    pub fn total_bytes(&self) -> u64 {
+        self.total
+    }
+
+    /// Add the selection of one pack. The whole library zip is validated first (same checks as an
+    /// import); only `Content/` entries are accepted.
+    pub fn add_subset(
+        &mut self,
+        entry: &LibraryEntry,
+        index: &AssetIndex,
+        sel: &Selection,
+    ) -> Result<SubsetExport, BundleError> {
+        if sel.game_paths.is_empty() {
+            return Err(ImportError::EmptySelection.into());
+        }
+        require_subset_kind(entry)?;
+        let plan = plan_subset(index, sel)?;
+        let mut zip = open_zip(entry)?;
+        let (mut infos, repairs) = subset_infos(entry, &mut zip, &plan)?;
+        if let Some(e) = infos.iter().find(|e| !under_content(&e.path)) {
+            return Err(ImportError::OutsideAllowedRoots(e.path.clone()).into());
+        }
+        infos.sort_by(|a, b| a.path.cmp(&b.path));
+        let fresh: u64 = infos
+            .iter()
+            .filter(|e| !self.by_lower.contains_key(&e.path.to_lowercase()))
+            .map(|e| e.size)
+            .sum();
+        let would_be = self.total.saturating_add(fresh);
+        if would_be > self.cap {
+            return Err(BundleError::CapExceeded {
+                size: would_be,
+                cap: self.cap,
+            });
+        }
+        for e in &infos {
+            let lower = e.path.to_lowercase();
+            if let Some(&i) = self.by_lower.get(&lower) {
+                let (_, sha) = stream_entry(&mut zip, &repairs, e, &mut io::sink())?;
+                let prev = &self.files[i];
+                if prev.path != e.path {
+                    self.conflicts
+                        .insert(format!("{} vs {}", prev.path, e.path));
+                } else if sha != prev.sha256 {
+                    self.conflicts.insert(e.path.clone());
+                }
+                continue;
+            }
+            let lowered = e.path.to_ascii_lowercase();
+            let stored = lowered.ends_with(".uexp") || lowered.ends_with(".ubulk");
+            let opts = SimpleFileOptions::default()
+                .compression_method(if stored {
+                    CompressionMethod::Stored
+                } else {
+                    CompressionMethod::Deflated
+                })
+                .large_file(e.size >= u64::from(u32::MAX));
+            self.zip.start_file(e.path.clone(), opts)?;
+            let (n, sha) = stream_entry(&mut zip, &repairs, e, &mut self.zip)?;
+            self.by_lower.insert(lower, self.files.len());
+            self.files.push(BundleFile {
+                path: e.path.clone(),
+                size: n,
+                sha256: sha,
+            });
+            self.total += n;
+        }
+        Ok(SubsetExport {
+            files: infos.len(),
+            external_missing: plan.external_missing,
+            unselected_deps: plan.unselected_deps,
+        })
+    }
+
+    /// Write `manifest.json` (the caller's fields plus `format`, `files` and
+    /// `total_uncompressed_bytes`), close the zip and hash it. Fails with
+    /// [`BundleError::Conflict`] when two packs disagreed about a path.
+    pub fn finish(
+        mut self,
+        mut manifest: Map<String, Value>,
+    ) -> Result<BundleOutcome, BundleError> {
+        if !self.conflicts.is_empty() {
+            return Err(BundleError::Conflict(
+                std::mem::take(&mut self.conflicts).into_iter().collect(),
+            ));
+        }
+        let rules: Vec<EntryInfo> = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, f)| EntryInfo {
+                index,
+                path: f.path.clone(),
+                is_dir: false,
+                size: f.size,
+            })
+            .collect();
+        check_paths(&rules).map_err(|e| BundleError::Import(ImportError::Unsafe(e)))?;
+        let mut files = std::mem::take(&mut self.files);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        manifest.insert("format".into(), Value::from(BUNDLE_FORMAT));
+        manifest.insert(
+            "files".into(),
+            serde_json::to_value(&files).map_err(|e| BundleError::Io(e.to_string()))?,
+        );
+        manifest.insert("total_uncompressed_bytes".into(), Value::from(self.total));
+        let bytes = serde_json::to_vec(&Value::Object(manifest))
+            .map_err(|e| BundleError::Io(e.to_string()))?;
+        self.zip.start_file(
+            BUNDLE_MANIFEST,
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        )?;
+        self.zip.write_all(&bytes)?;
+        let mut out = self.zip.finish()?;
+        out.flush()?;
+        let file = out
+            .into_inner()
+            .map_err(|e| BundleError::Io(e.to_string()))?;
+        file.sync_all()?;
+        drop(file);
+        let size_bytes = fs::metadata(&self.path)?.len();
+        let sha256 = sha256_file(&self.path)?;
+        Ok(BundleOutcome {
+            files,
+            uncompressed_bytes: self.total,
+            size_bytes,
+            sha256,
+        })
+    }
 }
 
 fn validate_project_name(name: &str) -> Result<(), ImportError> {
