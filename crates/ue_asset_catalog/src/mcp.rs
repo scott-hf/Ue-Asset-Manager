@@ -133,12 +133,12 @@ impl Server {
                             "name": tools::SERVER_NAME,
                             "version": tools::SERVER_VERSION,
                         },
-                        "instructions": tools::INSTRUCTIONS,
+                        "instructions": self.app.instructions(),
                     }),
                 )
             }
             "ping" => result_response(id, json!({})),
-            "tools/list" => result_response(id, json!({"tools": tools::tool_definitions()})),
+            "tools/list" => result_response(id, json!({"tools": self.app.visible_tools()})),
             "tools/call" => self.on_tool_call(id, params),
             _ => error_response(id, METHOD_NOT_FOUND, &format!("method not found: {method}")),
         }

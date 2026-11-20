@@ -1,9 +1,14 @@
-//! `ue_asset_mcp`: stdio MCP server over the local Unreal asset library.
-//! Only protocol messages go to stdout; every log line goes to stderr.
+//! `ue_asset_mcp`: MCP server over the local Unreal asset library, on stdio (default) or, with
+//! `--http`, a read-only HTTP service. On stdio only protocol messages go to stdout; every log
+//! line goes to stderr.
 
 use std::io::{self, BufReader};
+use std::net::TcpListener;
 use std::process::ExitCode;
-use ue_asset_catalog::config::{parse_args, Mode, Parsed, USAGE};
+use ue_asset_catalog::catalog::Catalog;
+use ue_asset_catalog::config::{parse_args, HttpConfig, Mode, Parsed, USAGE};
+use ue_asset_catalog::http_server::{self, Limits, StartOptions};
+use ue_asset_catalog::tools::{load_catalog, AppConfig};
 use ue_asset_catalog::{mcp, selftest, App, Server};
 
 fn main() -> ExitCode {
@@ -23,6 +28,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Mode::Http(http) = &mode {
+        return run_http(cfg, http);
+    }
     let mut app = App::new(cfg);
     {
         let st = app.catalog.stats();
@@ -66,4 +74,50 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The hosted, read-only HTTP service. Exit 2: no usable token file.
+fn run_http(cfg: AppConfig, http: &HttpConfig) -> ExitCode {
+    let Some(token_file) = &http.token_file else {
+        eprintln!("ue_asset_mcp: --http needs --token-file <file> with the bearer token");
+        return ExitCode::from(2);
+    };
+    let token = match http_server::read_token_file(token_file) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ue_asset_mcp: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let listener = match TcpListener::bind(http.addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ue_asset_mcp: cannot bind {}: {e}", http.addr);
+            return ExitCode::from(1);
+        }
+    };
+    let loader_cfg = cfg.clone();
+    let app = App::with_catalog(Catalog::empty(), cfg);
+    let running = match http_server::start(
+        listener,
+        app,
+        Box::new(move || load_catalog(&loader_cfg)),
+        StartOptions {
+            token,
+            allowed_hosts: http.allowed_hosts.clone(),
+            limits: Limits::default(),
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ue_asset_mcp: cannot start the HTTP server: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    eprintln!(
+        "[ue_asset_mcp] listening on http://{} (read-only; catalog loading in the background)",
+        running.local_addr
+    );
+    running.wait();
+    ExitCode::SUCCESS
 }

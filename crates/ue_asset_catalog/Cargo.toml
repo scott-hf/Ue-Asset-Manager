@@ -21,6 +21,7 @@ path = "src/bin/ue_asset_enrich.rs"
 ue_asset_library = { path = "../ue_asset_library" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 zip = "8"

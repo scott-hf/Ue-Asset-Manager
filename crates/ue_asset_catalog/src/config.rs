@@ -4,6 +4,7 @@ use crate::catalog::LoadOptions;
 use crate::install_log;
 use crate::tools::AppConfig;
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub const USAGE: &str = "\
@@ -34,9 +35,17 @@ OPTIONS:
                         the HF infrastructure token file). Never logged or returned.
   --max-generations <n> Generation jobs per server session (default 5).
   --selftest            Load the library, print stats and sample searches, then exit.
+  --http <ip:port>      Serve MCP over HTTP (POST /mcp, GET /health) instead of stdio. Needs a concrete
+                        interface address (0.0.0.0 and :: are refused); implies --read-only.
+  --token-file <file>   Bearer token for --http (required; exit 2 if missing or empty). Never logged.
+  --allowed-host <h:p>  Extra accepted Host header value (repeatable; default: the --http address).
+  --read-only           Hide and refuse every tool that writes or changes state (import_assets,
+                        plan_import, list_projects, refresh_catalog; the generation tools unless
+                        --allow-generation). Cannot be combined with --write-overlays.
   --version, --help
 
-The server speaks MCP (JSON-RPC 2.0, one message per line) on stdin/stdout; logs go to stderr.";
+Without --http the server speaks MCP (JSON-RPC 2.0, one message per line) on stdin/stdout; logs go
+to stderr.";
 
 /// `<cache dir>/ue_asset_catalog/<name>` next to the catalog cache.
 fn cache_dir_file(name: &str) -> Option<PathBuf> {
@@ -59,10 +68,19 @@ pub enum Parsed {
     Version,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `--http` settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpConfig {
+    pub addr: SocketAddr,
+    pub token_file: Option<PathBuf>,
+    pub allowed_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Serve,
     SelfTest,
+    Http(HttpConfig),
 }
 
 /// Parse the arguments after the program name.
@@ -80,6 +98,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut use_log = true;
     let mut mode = Mode::Serve;
     let mut configs: Vec<PathBuf> = Vec::new();
+    let mut http: Option<SocketAddr> = None;
+    let mut token_file: Option<PathBuf> = None;
+    let mut allowed_hosts: Vec<String> = Vec::new();
+    let mut read_only = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -117,6 +139,22 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--install-log" => log = Some(PathBuf::from(value("--install-log")?)),
             "--no-install-log" => use_log = false,
             "--selftest" => mode = Mode::SelfTest,
+            "--read-only" => read_only = true,
+            "--http" => {
+                let v = value("--http")?;
+                let addr: SocketAddr = v
+                    .parse()
+                    .map_err(|_| format!("--http needs <ip>:<port> (got `{v}`)"))?;
+                if addr.ip().is_unspecified() {
+                    return Err(
+                        "--http must bind one concrete interface address, never 0.0.0.0 or ::"
+                            .to_string(),
+                    );
+                }
+                http = Some(addr);
+            }
+            "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
+            "--allowed-host" => allowed_hosts.push(value("--allowed-host")?.to_ascii_lowercase()),
             other => return Err(format!("unknown argument `{other}` (see --help)")),
         }
     }
@@ -130,6 +168,29 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     }
     if libraries.is_empty() {
         return Err("at least one --library <dir> is required (see --help)".to_string());
+    }
+    if http.is_some() {
+        if mode == Mode::SelfTest {
+            return Err("--selftest cannot be combined with --http".to_string());
+        }
+        read_only = true; // the hosted profile is always read-only
+    } else if token_file.is_some() || !allowed_hosts.is_empty() {
+        return Err("--token-file and --allowed-host need --http".to_string());
+    }
+    if read_only && write_overlays {
+        return Err(
+            "--read-only (and --http) cannot be combined with --write-overlays".to_string(),
+        );
+    }
+    if let Some(addr) = http {
+        if allowed_hosts.is_empty() {
+            allowed_hosts.push(addr.to_string());
+        }
+        mode = Mode::Http(HttpConfig {
+            addr,
+            token_file,
+            allowed_hosts,
+        });
     }
     let cache_path = if use_cache {
         cache.or_else(install_log::default_cache_path)
@@ -159,6 +220,8 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }),
             exclude_packs,
             generation,
+            read_only,
+            no_auto_refresh: matches!(mode, Mode::Http(_)),
         },
         mode,
     ))

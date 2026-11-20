@@ -31,6 +31,49 @@ assets, default `http://192.168.12.201:13000`) / `--no-generated`, `--allow-gene
 Startup is slow only the first time (indexes are built from the zips and cached in
 `%LOCALAPPDATA%\ue_asset_catalog\catalog.json`); the sanitizer writes the overlays for new packs.
 
+## Hosted, read-only HTTP mode
+
+```
+ue_asset_mcp --library F:\ue_assets_library\library --http 192.168.12.201:8433 \
+  --token-file C:\HF\ue_asset_mcp\token.txt --cache C:\HF\ue_asset_mcp\catalog.json \
+  --no-generated --no-install-log
+```
+
+One shared service serves the read tools to LAN clients (pattern: DOC-0192, code refs DOC-0232;
+hand-rolled `std::net` listener, still no HTTP crate or async runtime).
+
+* `--http <ip:port>` replaces stdio. It must be a concrete interface address: `0.0.0.0` and `::` are
+  refused. `--http` implies `--read-only`.
+* `--token-file <file>` is required; a missing, unreadable or empty file exits with code 2. The token
+  (trimmed) is never logged, echoed or put in an error. Every route except `GET /health` needs
+  `Authorization: Bearer <token>` (constant-time compare, else 401).
+* `--allowed-host <host:port>` (repeatable) adds accepted `Host` values (default: the `--http`
+  address); a wrong `Host` or any `Origin` header is 403.
+* `--read-only` (also usable on stdio) hides and refuses `import_assets`, `plan_import`,
+  `list_projects`, `refresh_catalog` and, unless `--allow-generation`, `request_generation` and
+  `generation_status`: `isError` text `error: READ_ONLY: ...`. It cannot be combined with
+  `--write-overlays`; the server never writes into the library. Only the `--cache` file and the
+  thumbnail cache are written.
+* Routes: `POST /mcp` (one JSON-RPC message per request: 200 with the reply, 202 for a
+  notification, 400 for a batch or broken JSON or an unknown `MCP-Protocol-Version`, 411 without
+  `Content-Length`, 413 over 1 MiB, 405 on other methods), `GET /health` (open; status, version,
+  `read_only`, packs, assets, `catalog_generation`, `catalog_loaded_at`), `GET /bundles/<id>` (404
+  until the bundle store exists). Every response is `Connection: close`; read deadline 10 s, write
+  timeout 60 s, header block <= 16 KiB; worker pools 8 (`/mcp`, `/health`) and 2 (`/bundles`), a full
+  pool answers 503 `BUSY`.
+* The catalog loads on a background thread after the port is bound: `/health` reports
+  `"status":"loading"` and tool calls answer `BUSY` until the first load ends (about 55 s without a
+  cache for the real library, under a second with `--cache`). The thread then rescans every 30 s and
+  swaps in a changed library; an empty load never replaces a good catalog. The catalog lock is held
+  only while a tool runs.
+* Thumbnails: `get_thumbnail` keeps its MCP result (a text block plus an `image` block with base64
+  data and `mimeType`); a client that cannot show image blocks saves the decoded bytes to a file.
+* Access log (stderr): method, path, status and milliseconds only.
+* Accepted residual risk: plain HTTP with one shared bearer token on a trusted LAN (no TLS). An
+  attacker on the LAN could read the token. Reopen if an untrusted device joins, the service leaves
+  the LAN, or per-client revocation is needed. Never bind a wildcard address; the token plus the
+  interface binding are the only access control.
+
 ## Claude Code (`.mcp.json`)
 
 ```json

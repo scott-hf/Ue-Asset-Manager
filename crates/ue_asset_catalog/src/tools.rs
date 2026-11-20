@@ -50,6 +50,15 @@ Imports only write into projects that were registered when the server started (l
 and never overwrite files unless you pass overwrite=true (then files are backed up). \
 list_packs / get_pack / list_tags help you browse; refresh_catalog rescans the library.";
 
+/// The `initialize` instructions of the read-only (hosted) profile.
+pub const INSTRUCTIONS_READ_ONLY: &str = "\
+This server is a read-only offline catalog of every asset inside a library of Unreal Engine asset \
+packs (zip archives that you never need to open). Workflow: (1) search_assets with plain words \
+(\"grass\", \"stone wall\", \"wooden door\") to find existing meshes, materials, textures, \
+blueprints, Niagara systems, animations and sounds; (2) get_asset / get_thumbnail to inspect a \
+hit (ids look like `<packId>:<gamePath>`); list_packs / get_pack / list_tags help you browse. \
+This server never writes anything: it cannot import into a project.";
+
 /// A project the server is allowed to write into.
 pub use crate::import::ProjectTarget as Registered;
 
@@ -67,6 +76,42 @@ pub struct AppConfig {
     pub exclude_packs: Vec<String>,
     /// `request_generation` settings (off unless `allowed`).
     pub generation: GenerationConfig,
+    /// Hosted profile: tools that write or change state are hidden and refused (`READ_ONLY`).
+    pub read_only: bool,
+    /// Never rescan from the request path (the HTTP server rescans on a background thread).
+    pub no_auto_refresh: bool,
+}
+
+/// Tools refused (and hidden) in the read-only profile. The generation pair stays available only
+/// when `--allow-generation` was given.
+const WRITE_TOOLS: [&str; 4] = [
+    "import_assets",
+    "plan_import",
+    "list_projects",
+    "refresh_catalog",
+];
+const GENERATION_TOOLS: [&str; 2] = ["request_generation", "generation_status"];
+
+impl AppConfig {
+    /// Is `name` unavailable in this configuration?
+    pub fn tool_blocked(&self, name: &str) -> bool {
+        self.read_only
+            && (WRITE_TOOLS.contains(&name)
+                || (GENERATION_TOOLS.contains(&name) && !self.generation.allowed))
+    }
+}
+
+/// Load the catalog plus the optional generated-assets source (no `App` needed, so a background
+/// thread can do this without any lock).
+pub fn load_catalog(cfg: &AppConfig) -> (Catalog, LoadReport, FetchReport) {
+    let (mut catalog, report) = Catalog::load(&cfg.libraries, &cfg.load);
+    let mut fetch = FetchReport::default();
+    if let Some(portal) = &cfg.portal {
+        let (items, rep) = generated::load(portal);
+        catalog.add_generated(&items);
+        fetch = rep;
+    }
+    (catalog, report, fetch)
 }
 
 pub enum Content {
@@ -421,6 +466,45 @@ impl App {
         app
     }
 
+    /// The `tools/list` payload of this configuration (blocked tools are hidden).
+    pub fn visible_tools(&self) -> Vec<Value> {
+        tool_definitions()
+            .into_iter()
+            .filter(|t| {
+                t.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| !self.cfg.tool_blocked(n))
+            })
+            .collect()
+    }
+
+    /// The `initialize` instructions of this configuration.
+    pub fn instructions(&self) -> &'static str {
+        if self.cfg.read_only {
+            INSTRUCTIONS_READ_ONLY
+        } else {
+            INSTRUCTIONS
+        }
+    }
+
+    /// Swap in a freshly loaded catalog. An empty load never replaces a non-empty one (keep the
+    /// last good snapshot); returns whether the swap happened.
+    pub fn install_catalog(
+        &mut self,
+        catalog: Catalog,
+        report: LoadReport,
+        generated: FetchReport,
+    ) -> bool {
+        if catalog.assets.is_empty() && !self.catalog.assets.is_empty() {
+            return false;
+        }
+        self.catalog = catalog;
+        self.load_report = report;
+        self.generated_report = generated;
+        self.last_check = Instant::now();
+        true
+    }
+
     /// Add the finished pipeline jobs (read-only source) when a portal is configured. A portal
     /// that cannot be reached falls back to the cached list and never fails the load.
     pub fn load_generated(&mut self) {
@@ -473,7 +557,7 @@ impl App {
     }
 
     fn maybe_refresh(&mut self) {
-        if self.last_check.elapsed() < REFRESH_INTERVAL {
+        if self.cfg.no_auto_refresh || self.last_check.elapsed() < REFRESH_INTERVAL {
             return;
         }
         self.last_check = Instant::now();
@@ -501,6 +585,11 @@ impl App {
         ];
         if !known.contains(&name) {
             return None;
+        }
+        if self.cfg.tool_blocked(name) {
+            return Some(ToolOutput::error(format!(
+                "READ_ONLY: `{name}` is not available on this read-only server; it never writes or changes state. Use search_assets, get_asset, list_packs, get_pack, list_tags or get_thumbnail."
+            )));
         }
         if name != "refresh_catalog" {
             self.maybe_refresh();

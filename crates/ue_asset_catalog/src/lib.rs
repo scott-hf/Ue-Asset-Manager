@@ -40,6 +40,7 @@
 //!   `request_generation` client.
 //! * [`vision`] / [`enrich`]: optional vision-model descriptions (`<zip>.vision.json`).
 //! * [`mcp`] / [`tools`] / [`config`]: the JSON-RPC server, its tools and command line.
+//! * [`http_server`]: the read-only HTTP transport (`--http`), std::net only.
 
 pub mod b64;
 pub mod catalog;
@@ -48,6 +49,7 @@ pub mod enrich;
 pub mod generated;
 pub mod generation;
 pub mod http;
+pub mod http_server;
 pub mod import;
 pub mod install_log;
 pub mod mcp;
