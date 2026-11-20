@@ -1,5 +1,7 @@
 # Host-side checks for the HFUeAssetMcp service. Reads the token from the token file and never prints it.
-# Restarts the service twice to time cold (cache deleted) and warm (cache present) start to /health 200.
+# Restarts the service twice to time cold (cache deleted) and warm (cache present) start.
+# Each start reports two times: listener (first /health 200, status may still be "loading") and
+# ready (/health status "ok" = catalog loaded; tools/call answers BUSY until then).
 param([switch]$NoRestart)
 $ErrorActionPreference = 'Continue'
 $dst = 'C:\HF\ue_asset_mcp'
@@ -7,11 +9,19 @@ $base = 'http://192.168.12.201:8433'
 $tok = (Get-Content -LiteralPath "$dst\token.txt" -Raw).Trim()
 function Wait-Health {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $listener = -1
     while ($sw.Elapsed.TotalSeconds -lt 240) {
-        try { $r = Invoke-WebRequest -UseBasicParsing -Uri "$base/health" -TimeoutSec 3; if ($r.StatusCode -eq 200) { return [math]::Round($sw.Elapsed.TotalSeconds, 1) } } catch {}
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing -Uri "$base/health" -TimeoutSec 3
+            if ($r.StatusCode -eq 200) {
+                $t = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                if ($listener -lt 0) { $listener = $t }
+                if ((ConvertFrom-Json $r.Content).status -eq 'ok') { return "listener $listener s, ready $t s" }
+            }
+        } catch {}
         Start-Sleep -Milliseconds 250
     }
-    return -1
+    return "listener $listener s, ready timeout (240 s)"
 }
 function Restart-Svc($dropCache) {
     Get-Process ue_asset_mcp -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -21,8 +31,8 @@ function Restart-Svc($dropCache) {
     return Wait-Health
 }
 if (-not $NoRestart) {
-    Write-Output ("cold start seconds (no cache): " + (Restart-Svc $true))
-    Write-Output ("warm start seconds (cache): " + (Restart-Svc $false))
+    Write-Output ("cold start (no cache): " + (Restart-Svc $true))
+    Write-Output ("warm start (cache): " + (Restart-Svc $false))
 }
 function Mcp($body, $auth) {
     $h = @{}
