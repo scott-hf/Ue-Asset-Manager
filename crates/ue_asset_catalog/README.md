@@ -64,8 +64,9 @@ hand-rolled `std::net` listener, still no HTTP crate or async runtime).
 * The catalog loads on a background thread after the port is bound: `/health` reports
   `"status":"loading"` and tool calls answer `BUSY` until the first load ends (about 55 s without a
   cache for the real library, under a second with `--cache`). The thread then rescans every 30 s and
-  swaps in a changed library; an empty load never replaces a good catalog. The catalog lock is held
-  only while a tool runs.
+  swaps in a changed library, at most once per 5 minutes (the enrichment task rewrites sidecars all
+  day; the pending change is loaded by a later probe); an empty load never replaces a good catalog.
+  The catalog lock is held only while a tool runs.
 * Thumbnails: `get_thumbnail` keeps its MCP result (a text block plus an `image` block with base64
   data and `mimeType`); a client that cannot show image blocks saves the decoded bytes to a file.
 * Access log (stderr): method, path, status and milliseconds only.

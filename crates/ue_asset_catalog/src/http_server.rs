@@ -44,6 +44,10 @@ pub struct Limits {
     pub max_connections: usize,
     /// How often the background thread looks for a changed library.
     pub refresh_interval: Duration,
+    /// Minimum time between two reloads of a library that keeps changing (the enrichment task
+    /// rewrites sidecars all day; each reload re-reads the whole library). An empty catalog is
+    /// retried every `refresh_interval` regardless.
+    pub min_reload_gap: Duration,
 }
 
 impl Default for Limits {
@@ -58,6 +62,7 @@ impl Default for Limits {
             bundle_pool: 2,
             max_connections: 64,
             refresh_interval: crate::tools::REFRESH_INTERVAL,
+            min_reload_gap: Duration::from_secs(300),
         }
     }
 }
@@ -803,6 +808,7 @@ fn background(shared: Arc<Shared>, loader: Loader, stop: Arc<AtomicBool>) {
     let mut empty = catalog.assets.is_empty();
     install(&shared, catalog, report, fetch);
     shared.ready.store(true, Ordering::SeqCst);
+    let mut last_reload = Instant::now();
     loop {
         let wake = Instant::now() + shared.limits.refresh_interval;
         while Instant::now() < wake {
@@ -821,8 +827,14 @@ fn background(shared: Arc<Shared>, loader: Loader, stop: Arc<AtomicBool>) {
         if !empty && now == seen {
             continue;
         }
+        // A library that keeps changing is reloaded at most once per `min_reload_gap`; the change
+        // is picked up by a later probe, nothing is lost.
+        if !empty && last_reload.elapsed() < shared.limits.min_reload_gap {
+            continue;
+        }
         eprintln!("[ue_asset_mcp] library changed, reloading catalog");
         let (catalog, report, fetch) = loader();
+        last_reload = Instant::now();
         let fp = catalog.fingerprint;
         let dirs_new = catalog.dirs.clone();
         let assets_empty = catalog.assets.is_empty();

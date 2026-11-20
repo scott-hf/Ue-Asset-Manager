@@ -588,6 +588,7 @@ fn health_answers_while_the_catalog_loads() {
 fn background_refresh_swaps_and_keeps_the_last_good_catalog() {
     let limits = Limits {
         refresh_interval: Duration::from_millis(150),
+        min_reload_gap: Duration::ZERO,
         ..Limits::default()
     };
     let h = Hosted::start_with(false, limits);
@@ -623,6 +624,38 @@ fn background_refresh_swaps_and_keeps_the_last_good_catalog() {
     );
     let v: Value = serde_json::from_str(&tool_text(&r)).unwrap();
     assert_eq!(v["total"], 1);
+    let _ = &h.tmp;
+}
+
+#[test]
+fn a_changing_library_is_reloaded_at_most_once_per_gap() {
+    let limits = Limits {
+        refresh_interval: Duration::from_millis(100),
+        min_reload_gap: Duration::from_millis(2500),
+        ..Limits::default()
+    };
+    let h = Hosted::start_with(false, limits);
+    let generation = |h: &Hosted| {
+        h.get("/health", &[]).json()["catalog_generation"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(generation(&h), 1);
+    make_pack(
+        &h.lib,
+        "Garden Kit",
+        'e',
+        &[("/Game/Garden/SM_Fence", "StaticMesh")],
+    );
+    // Well inside the gap the change is seen but not yet loaded.
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(generation(&h), 1, "reloaded inside the minimum gap");
+    // After the gap the pending change is picked up without another edit.
+    let end = Instant::now() + Duration::from_secs(10);
+    while generation(&h) < 2 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(generation(&h), 2, "the change was never loaded");
     let _ = &h.tmp;
 }
 
