@@ -68,8 +68,8 @@ impl Default for Limits {
 }
 
 pub struct StartOptions {
-    /// The bearer token (already trimmed, non-empty).
-    pub token: Vec<u8>,
+    /// The bearer token (already trimmed, non-empty); `None` = no authentication (`--no-auth`).
+    pub token: Option<Vec<u8>>,
     /// Accepted `Host` header values; empty = the listener's own `ip:port`.
     pub allowed_hosts: Vec<String>,
     pub limits: Limits,
@@ -134,7 +134,7 @@ impl Pool {
 
 struct Shared {
     server: Mutex<Server>,
-    token_digest: [u8; 32],
+    token_digest: Option<[u8; 32]>,
     allowed_hosts: Vec<String>,
     limits: Limits,
     read_only: bool,
@@ -667,13 +667,13 @@ fn respond(
         return Resp::error(405, "METHOD", "method not allowed").with("Allow", allow);
     }
     // 4. Bearer (everything except /health).
-    if !matches!(route, Route::Health) {
+    if let (false, Some(want)) = (matches!(route, Route::Health), shared.token_digest.as_ref()) {
         let presented = req
             .header("authorization")
             .and_then(|a| a.split_once(' '))
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
             .map(|(_, t)| t.trim());
-        let ok = presented.is_some_and(|t| ct_eq(&digest(t.as_bytes()), &shared.token_digest));
+        let ok = presented.is_some_and(|t| ct_eq(&digest(t.as_bytes()), want));
         if !ok {
             return Resp::error(401, "UNAUTHORIZED", "a valid bearer token is required")
                 .with("WWW-Authenticate", "Bearer");
@@ -913,7 +913,7 @@ pub fn start(
     let shared = Arc::new(Shared {
         read_only: app.cfg.read_only,
         server: Mutex::new(Server::new(app)),
-        token_digest: digest(&opts.token),
+        token_digest: opts.token.as_deref().map(digest),
         allowed_hosts,
         mcp_pool: Pool::new(limits.mcp_pool),
         bundle_pool: Pool::new(limits.bundle_pool),

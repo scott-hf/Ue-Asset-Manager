@@ -45,7 +45,9 @@ OPTIONS:
   --selftest            Load the library, print stats and sample searches, then exit.
   --http <ip:port>      Serve MCP over HTTP (POST /mcp, GET /health) instead of stdio. Needs a concrete
                         interface address (0.0.0.0 and :: are refused); implies --read-only.
-  --token-file <file>   Bearer token for --http (required; exit 2 if missing or empty). Never logged.
+  --token-file <file>   Bearer token for --http (exit 2 if missing or empty). Never logged.
+  --no-auth             With --http: serve without a bearer token (LAN-only, read-only service). One of
+                        --token-file or --no-auth is required with --http; they exclude each other.
   --allowed-host <h:p>  Extra accepted Host header value (repeatable; default: the --http address).
   --bundle-dir <dir>    With --http: server-local folder for import bundles; turns on the prepare_import
                         tool and GET /bundles/<id>. The server writes only here (never the library).
@@ -89,6 +91,8 @@ pub enum Parsed {
 pub struct HttpConfig {
     pub addr: SocketAddr,
     pub token_file: Option<PathBuf>,
+    /// `--no-auth`: no bearer token is required (explicit opt-out).
+    pub no_auth: bool,
     pub allowed_hosts: Vec<String>,
 }
 
@@ -116,6 +120,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut configs: Vec<PathBuf> = Vec::new();
     let mut http: Option<SocketAddr> = None;
     let mut token_file: Option<PathBuf> = None;
+    let mut no_auth = false;
     let mut allowed_hosts: Vec<String> = Vec::new();
     let mut read_only = false;
     let mut bundle_dir: Option<PathBuf> = None;
@@ -206,6 +211,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 http = Some(addr);
             }
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
+            "--no-auth" => no_auth = true,
             "--allowed-host" => allowed_hosts.push(value("--allowed-host")?.to_ascii_lowercase()),
             other => return Err(format!("unknown argument `{other}` (see --help)")),
         }
@@ -226,8 +232,13 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             return Err("--selftest cannot be combined with --http".to_string());
         }
         read_only = true; // the hosted profile is always read-only
-    } else if token_file.is_some() || !allowed_hosts.is_empty() || bundle_flags {
-        return Err("--token-file, --allowed-host and the bundle flags need --http".to_string());
+        if no_auth && token_file.is_some() {
+            return Err("--no-auth and --token-file exclude each other".to_string());
+        }
+    } else if token_file.is_some() || no_auth || !allowed_hosts.is_empty() || bundle_flags {
+        return Err(
+            "--token-file, --no-auth, --allowed-host and the bundle flags need --http".to_string(),
+        );
     }
     let bundle = match bundle_dir {
         Some(dir) if http.is_some() => {
@@ -248,6 +259,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
         mode = Mode::Http(HttpConfig {
             addr,
             token_file,
+            no_auth,
             allowed_hosts,
         });
     }

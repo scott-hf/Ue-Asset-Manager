@@ -1,4 +1,4 @@
-# Host-side checks for the HFUeAssetMcp service. Reads the token from the token file and never prints it.
+# Host-side checks for the HFUeAssetMcp service. No bearer token is used (the service runs with --no-auth).
 # Restarts the service twice to time cold (cache deleted) and warm (cache present) start.
 # Each start reports two times: listener (first /health 200, status may still be "loading") and
 # ready (/health status "ok" = catalog loaded; tools/call answers BUSY until then).
@@ -6,7 +6,6 @@ param([switch]$NoRestart)
 $ErrorActionPreference = 'Continue'
 $dst = 'C:\HF\ue_asset_mcp'
 $base = 'http://192.168.12.201:8433'
-$tok = (Get-Content -LiteralPath "$dst\token.txt" -Raw).Trim()
 function Wait-Health {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $listener = -1
@@ -34,9 +33,8 @@ if (-not $NoRestart) {
     Write-Output ("cold start (no cache): " + (Restart-Svc $true))
     Write-Output ("warm start (cache): " + (Restart-Svc $false))
 }
-function Mcp($body, $auth) {
+function Mcp($body) {
     $h = @{}
-    if ($auth) { $h['Authorization'] = "Bearer $tok" }
     try {
         $r = Invoke-WebRequest -UseBasicParsing -Uri "$base/mcp" -Method Post -ContentType 'application/json' -Headers $h -Body $body -TimeoutSec 60
         return @{ code = [int]$r.StatusCode; body = $r.Content }
@@ -48,11 +46,10 @@ function Mcp($body, $auth) {
 $h = Invoke-WebRequest -UseBasicParsing -Uri "$base/health" -TimeoutSec 5
 Write-Output "health: $($h.StatusCode)"
 $list = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-Write-Output ("tools/list no token: " + (Mcp $list $false).code)
-$r = Mcp $list $true
-Write-Output ("tools/list with token: " + $r.code)
+$r = Mcp $list
+Write-Output ("tools/list no token: " + $r.code)
 $names = ([regex]::Matches($r.body, '"name"\s*:\s*"([a-z_]+)"') | ForEach-Object { $_.Groups[1].Value }) -join ','
 Write-Output "tools: $names"
 Write-Output ("import_assets listed: " + ($names -match '(^|,)import_assets(,|$)'))
-$s = Mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_assets","arguments":{"query":"grass","limit":3}}}' $true
-Write-Output ("search_assets grass: " + $s.code + " bytes=" + $s.body.Length)
+$s = Mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_assets","arguments":{"query":"grass","limit":3}}}'
+Write-Output ("search_assets grass (no token): " + $s.code + " bytes=" + $s.body.Length)

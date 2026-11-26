@@ -252,7 +252,7 @@ impl Hosted {
             app,
             Box::new(move || load_catalog(&loader_cfg)),
             StartOptions {
-                token: TOKEN.as_bytes().to_vec(),
+                token: Some(TOKEN.as_bytes().to_vec()),
                 allowed_hosts: Vec::new(),
                 limits: Limits::default(),
             },

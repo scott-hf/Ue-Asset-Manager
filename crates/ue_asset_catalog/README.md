@@ -35,7 +35,7 @@ Startup is slow only the first time (indexes are built from the zips and cached 
 
 ```
 ue_asset_mcp --library F:\ue_assets_library\library --http 192.168.12.201:8433 \
-  --token-file C:\HF\ue_asset_mcp\token.txt --cache C:\HF\ue_asset_mcp\catalog.json \
+  --no-auth --cache C:\HF\ue_asset_mcp\catalog.json \
   --no-generated --no-install-log
 ```
 
@@ -44,9 +44,13 @@ hand-rolled `std::net` listener, still no HTTP crate or async runtime).
 
 * `--http <ip:port>` replaces stdio. It must be a concrete interface address: `0.0.0.0` and `::` are
   refused. `--http` implies `--read-only`.
-* `--token-file <file>` is required; a missing, unreadable or empty file exits with code 2. The token
-  (trimmed) is never logged, echoed or put in an error. Every route except `GET /health` needs
-  `Authorization: Bearer <token>` (constant-time compare, else 401).
+* Exactly one of `--token-file <file>` or `--no-auth` is required. With `--token-file` a missing,
+  unreadable or empty file exits with code 2; the token (trimmed) is never logged, echoed or put in an
+  error, and every route except `GET /health` needs `Authorization: Bearer <token>` (constant-time
+  compare, else 401). With `--no-auth` (only valid with `--http`, excludes `--token-file`) no bearer
+  is required and an `Authorization` header, if sent, is ignored; the server logs `auth: none
+  (--no-auth)` at startup. Host/Origin checks, the read-only profile and the caps are unchanged. The
+  hosted HFUeAssetMcp service runs this way (LAN-only, read-only).
 * `--allowed-host <host:port>` (repeatable) adds accepted `Host` values (default: the `--http`
   address); a wrong `Host` or any `Origin` header is 403.
 * `--read-only` (also usable on stdio) hides and refuses `import_assets`, `plan_import`,
@@ -70,10 +74,10 @@ hand-rolled `std::net` listener, still no HTTP crate or async runtime).
 * Thumbnails: `get_thumbnail` keeps its MCP result (a text block plus an `image` block with base64
   data and `mimeType`); a client that cannot show image blocks saves the decoded bytes to a file.
 * Access log (stderr): method, path, status and milliseconds only.
-* Accepted residual risk: plain HTTP with one shared bearer token on a trusted LAN (no TLS). An
-  attacker on the LAN could read the token. Reopen if an untrusted device joins, the service leaves
-  the LAN, or per-client revocation is needed. Never bind a wildcard address; the token plus the
-  interface binding are the only access control.
+* Accepted residual risk: plain HTTP on a trusted LAN (no TLS) and, in `--no-auth` mode, no token at
+  all, so anyone who can reach the port can search and download bundles (read-only data). Reopen if
+  an untrusted device joins, the service leaves the LAN, or per-client revocation is needed. Never
+  bind a wildcard address; the interface binding is then the only access control.
 
 ### Prepared bundles (`prepare_import`)
 
@@ -82,7 +86,7 @@ registered under `--read-only`. It builds a verified zip on the server; the clie
 applies it to its own project. The server never touches a project and never writes into the library.
 
 ```
-ue_asset_mcp ... --http 192.168.12.201:8433 --token-file ... --bundle-dir C:\HF\ue_asset_mcp\bundles
+ue_asset_mcp ... --http 192.168.12.201:8433 --no-auth --bundle-dir C:\HF\ue_asset_mcp\bundles
 ```
 
 * Arguments: `asset_ids` (1 to 500 catalog ids), `project_engine_version` (e.g. `5.4`), and
@@ -103,7 +107,7 @@ ue_asset_mcp ... --http 192.168.12.201:8433 --token-file ... --bundle-dir C:\HF\
   `BUSY` (the build slot or the cache budget is taken; retry shortly), `CAP_EXCEEDED` (the bundle or
   the hourly budget is over its cap; the text names the size and the cap), `NOT_AVAILABLE` (the server
   has no `--bundle-dir`).
-* `GET /bundles/<id>` needs the same bearer token and answers 200 with `Content-Length`,
+* `GET /bundles/<id>` needs the same bearer token (none with `--no-auth`) and answers 200 with `Content-Length`,
   `X-Bundle-Sha256`, `X-Bundle-Id` and `Content-Type: application/zip`. It can be repeated until the
   bundle expires, 15 minutes after it was published; then 410 `BUNDLE_EXPIRED`. An id that never
   existed (or is not 32 hex digits) is 404. A bundle is published by an atomic rename, so a

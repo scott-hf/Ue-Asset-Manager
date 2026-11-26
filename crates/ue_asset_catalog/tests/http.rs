@@ -189,7 +189,7 @@ impl Hosted {
             app,
             loader,
             StartOptions {
-                token: TOKEN.as_bytes().to_vec(),
+                token: Some(TOKEN.as_bytes().to_vec()),
                 allowed_hosts: Vec::new(),
                 limits,
             },
@@ -668,6 +668,75 @@ fn run_bin(args: &[&str]) -> (Option<i32>, String) {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
+}
+
+#[test]
+fn no_auth_serves_without_a_bearer_header() {
+    let tmp = Tmp::new();
+    let lib = tmp.dir("lib");
+    build_library(&lib);
+    let cfg = app_config(&lib);
+    let loader_cfg = cfg.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::with_catalog(Catalog::empty(), cfg);
+    let running = http_server::start(
+        listener,
+        app,
+        Box::new(move || load_catalog(&loader_cfg)),
+        StartOptions {
+            token: None,
+            allowed_hosts: Vec::new(),
+            limits: Limits::default(),
+        },
+    )
+    .unwrap();
+    let addr = running.local_addr;
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        let r = raw_request(
+            addr,
+            format!("GET /health HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes(),
+        );
+        if r.status == 200 && r.json()["status"] == "ok" {
+            break;
+        }
+        assert!(Instant::now() < end, "catalog never became ready");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    for auth in ["", "Authorization: Bearer anything\r\n"] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let r = raw_request(addr, req.as_bytes());
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("import_assets"), "{}", r.body);
+    }
+    // The Host check still applies.
+    let r = raw_request(
+        addr,
+        b"POST /mcp HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_ne!(r.status, 200);
+}
+
+#[test]
+fn auth_flag_combinations() {
+    let tmp = Tmp::new();
+    let lib = tmp.dir("lib");
+    let lib_s = lib.to_string_lossy().to_string();
+    // --http needs exactly one of --token-file / --no-auth (exit 2 is the missing-token path; flag
+    // errors from the parser are exit 1).
+    let (code, err) = run_bin(&["--library", &lib_s, "--http", "127.0.0.1:0", "--no-auth", "--token-file", "x"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("exclude each other"), "{err}");
+    let (code, err) = run_bin(&["--library", &lib_s, "--no-auth"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("need --http"), "{err}");
+    let (code, err) = run_bin(&["--library", &lib_s, "--http", "127.0.0.1:0"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--no-auth"), "{err}");
 }
 
 #[test]

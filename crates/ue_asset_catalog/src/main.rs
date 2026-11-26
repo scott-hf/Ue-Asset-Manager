@@ -77,19 +77,25 @@ fn main() -> ExitCode {
     }
 }
 
-/// The hosted, read-only HTTP service. Exit 2: no usable token file.
+/// The hosted, read-only HTTP service. Exit 2: no usable token file (and no `--no-auth`).
 fn run_http(cfg: AppConfig, http: &HttpConfig) -> ExitCode {
-    let Some(token_file) = &http.token_file else {
-        eprintln!("ue_asset_mcp: --http needs --token-file <file> with the bearer token");
-        return ExitCode::from(2);
-    };
-    let token = match http_server::read_token_file(token_file) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("ue_asset_mcp: {e}");
+    let token = match (&http.token_file, http.no_auth) {
+        (Some(token_file), false) => match http_server::read_token_file(token_file) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("ue_asset_mcp: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        (None, true) => None,
+        _ => {
+            eprintln!("ue_asset_mcp: --http needs exactly one of --token-file <file> or --no-auth");
             return ExitCode::from(2);
         }
     };
+    if token.is_none() {
+        eprintln!("[ue_asset_mcp] auth: none (--no-auth)");
+    }
     if let Some(b) = &cfg.bundle {
         // The bundle folder is the only place this server writes: never inside the library.
         if let Err(e) = std::fs::create_dir_all(&b.dir) {
